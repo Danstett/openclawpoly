@@ -322,11 +322,25 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
     """Get price momentum from Binance public API.
     Returns: {momentum_pct, direction, price_now, price_then, avg_volume, candles}
     """
-    url = (
-        f"https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
-    )
-    result = _api_request(url)
+    # Try multiple Binance endpoints (some are blocked from cloud IPs)
+    endpoints = [
+        "https://api.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+        "https://data-api.binance.vision",
+    ]
+    
+    result = None
+    for base_url in endpoints:
+        url = f"{base_url}/api/v3/klines?symbol={symbol}&interval=1m&limit={lookback_minutes}"
+        result = _api_request(url)
+        if result and not isinstance(result, dict):
+            break  # Success - got list of klines
+        # Log which endpoint failed
+        error_msg = result.get("error", "Unknown error") if isinstance(result, dict) else "No response"
+        print(f"    (Binance {base_url} failed: {error_msg})")
+    
     if not result or isinstance(result, dict):
         return None
 
