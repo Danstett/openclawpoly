@@ -10,23 +10,41 @@ export async function GET() {
   }
 
   try {
-    // Get trade history - try different endpoints
-    const res = await fetch(`${SIMMER_BASE}/api/sdk/trades?limit=20`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'User-Agent': 'fastloop-dashboard/1.0',
-      },
-      cache: 'no-store',
-    })
+    // Try multiple endpoints to get trade history
+    const endpoints = [
+      '/api/sdk/trades?limit=50',
+      '/api/sdk/history?limit=50',
+      '/api/sdk/orders?limit=50',
+    ]
 
-    if (!res.ok) {
-      // Fallback: try positions endpoint which may include history
-      const error = await res.text()
-      return NextResponse.json({ trades: [], error }, { status: 200 })
+    let trades: any[] = []
+    let lastError = null
+
+    for (const endpoint of endpoints) {
+      try {
+        const res = await fetch(`${SIMMER_BASE}${endpoint}`, {
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'User-Agent': 'fastloop-dashboard/1.0',
+          },
+          cache: 'no-store',
+        })
+
+        if (res.ok) {
+          const data = await res.json()
+          // Extract trades from response
+          const tradesList = data.trades || data.orders || data.history || data.data || data
+          if (Array.isArray(tradesList) && tradesList.length > 0) {
+            trades = tradesList
+            break
+          }
+        }
+      } catch (e) {
+        lastError = e
+      }
     }
 
-    const data = await res.json()
-    return NextResponse.json(data)
+    return NextResponse.json({ trades, error: trades.length === 0 ? lastError : null })
   } catch (error) {
     return NextResponse.json({ trades: [], error: String(error) }, { status: 200 })
   }
