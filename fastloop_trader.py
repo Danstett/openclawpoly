@@ -243,15 +243,29 @@ def simmer_request(path, method="GET", data=None, api_key=None):
 def discover_fast_market_markets(asset="BTC", window="5m"):
     """Find active fast markets on Polymarket via Gamma API."""
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
+    
+    # Try multiple queries to find markets expiring soon
+    # 1. Sort by endDate ascending to get soonest-expiring first
+    # 2. Increase limit to catch more markets
     url = (
         "https://gamma-api.polymarket.com/markets"
-        "?limit=20&closed=false&tag=crypto&order=createdAt&ascending=false"
+        "?limit=50&closed=false&active=true&order=endDate&ascending=true"
     )
     result = _api_request(url)
+    if not result or isinstance(result, dict) and result.get("error"):
+        # Fallback to original query
+        url = (
+            "https://gamma-api.polymarket.com/markets"
+            "?limit=50&closed=false&tag=crypto&order=createdAt&ascending=false"
+        )
+        result = _api_request(url)
+    
     if not result or isinstance(result, dict) and result.get("error"):
         return []
 
     markets = []
+    now = datetime.now(timezone.utc)
+    
     for m in result:
         q = (m.get("question") or "").lower()
         slug = m.get("slug", "")
@@ -260,8 +274,28 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
             condition_id = m.get("conditionId", "")
             closed = m.get("closed", False)
             if not closed and slug:
-                # Parse end time from question (e.g., "5:30AM-5:35AM ET")
-                end_time = _parse_fast_market_end_time(m.get("question", ""))
+                # Try to get end time from API field first, fallback to parsing question
+                end_time = None
+                
+                # Check for endDate field from API
+                end_date_str = m.get("endDate") or m.get("end_date") or m.get("endDateIso")
+                if end_date_str:
+                    try:
+                        # Parse ISO format
+                        if isinstance(end_date_str, str):
+                            end_time = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                    except:
+                        pass
+                
+                # Fallback to parsing from question
+                if not end_time:
+                    end_time = _parse_fast_market_end_time(m.get("question", ""))
+                
+                # Debug: print what we found
+                remaining = (end_time - now).total_seconds() if end_time else None
+                if remaining and remaining > 0 and remaining < 7200:  # Within 2 hours
+                    print(f"  📍 Found: {m.get('question', '')[:50]}... expires in {remaining:.0f}s")
+                
                 markets.append({
                     "question": m.get("question", ""),
                     "slug": slug,
@@ -271,6 +305,7 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
                     "outcome_prices": m.get("outcomePrices", "[]"),
                     "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
                 })
+    
     return markets
 
 
