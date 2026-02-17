@@ -457,7 +457,7 @@ export default function Dashboard() {
                         </span>
                         {resolveTime && (
                           <span className="text-xs text-blue-400">
-                            resolves {resolveTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
+                            resolves {resolveTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' })} ET
                           </span>
                         )}
                       </div>
