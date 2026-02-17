@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from 'react'
 
 interface Position {
   market_id?: string
+  condition_id?: string
+  slug?: string
   question?: string
   shares_yes?: number
   shares_no?: number
@@ -223,6 +225,31 @@ export default function Dashboard() {
     }
   }
 
+  // Generate Polymarket URL for a position
+  const getPolymarketUrl = (pos: Position): string | null => {
+    // If we have a slug, use it directly
+    if (pos.slug) {
+      return `https://polymarket.com/event/${pos.slug}`
+    }
+    // If we have market_id that looks like a slug (contains letters), use it
+    if (pos.market_id && /[a-z]/.test(pos.market_id)) {
+      return `https://polymarket.com/event/${pos.market_id}`
+    }
+    // Try to construct slug from question for BTC fast markets
+    // "Bitcoin Up or Down - February 17, 1:35PM-1:40PM ET"
+    const question = pos.question || ''
+    if (question.toLowerCase().includes('bitcoin up or down')) {
+      // Extract the time window to determine 5m vs 15m
+      const timeMatch = question.match(/(\d+):(\d+)[AP]M-(\d+):(\d+)[AP]M/)
+      if (timeMatch && pos.resolves_at) {
+        const resolveTs = Math.floor(new Date(pos.resolves_at).getTime() / 1000)
+        const window = question.includes('15') ? '15m' : '5m'
+        return `https://polymarket.com/event/btc-updown-${window}-${resolveTs}`
+      }
+    }
+    return null
+  }
+
   // Status badge colors
   const getStatusBadge = (status: PositionStatus) => {
     switch (status) {
@@ -324,14 +351,26 @@ export default function Dashboard() {
               const pnl = pos.pnl || 0
               const value = pos.current_value || 0
               const cost = pos.cost_basis || 0
+              const polyUrl = getPolymarketUrl(pos)
               
               return (
                 <div key={i} className="p-3 rounded-lg bg-yellow-900/20 border border-yellow-700/50">
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate text-yellow-100">
-                        {formatShortMarket(pos.question || 'Unknown')}
-                      </div>
+                      {polyUrl ? (
+                        <a 
+                          href={polyUrl} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="text-sm font-medium truncate text-yellow-100 hover:text-yellow-300 hover:underline block"
+                        >
+                          {formatShortMarket(pos.question || 'Unknown')} ↗
+                        </a>
+                      ) : (
+                        <div className="text-sm font-medium truncate text-yellow-100">
+                          {formatShortMarket(pos.question || 'Unknown')}
+                        </div>
+                      )}
                       <div className="flex flex-wrap items-center gap-2 mt-1">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                           side === 'YES' 
@@ -382,14 +421,26 @@ export default function Dashboard() {
               const cost = pos.cost_basis || 0
               const avgPrice = pos.avg_cost || 0
               const resolveTime = pos.resolves_at ? new Date(pos.resolves_at) : null
+              const polyUrl = getPolymarketUrl(pos)
               
               return (
                 <div key={i} className="p-3 rounded-lg bg-blue-900/20 border border-blue-800/50">
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate">
-                        {formatShortMarket(pos.question || 'Unknown')}
-                      </div>
+                      {polyUrl ? (
+                        <a 
+                          href={polyUrl} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="text-sm font-medium truncate hover:text-blue-300 hover:underline block"
+                        >
+                          {formatShortMarket(pos.question || 'Unknown')} ↗
+                        </a>
+                      ) : (
+                        <div className="text-sm font-medium truncate">
+                          {formatShortMarket(pos.question || 'Unknown')}
+                        </div>
+                      )}
                       <div className="flex flex-wrap items-center gap-2 mt-1">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                           side === 'YES' 
@@ -442,6 +493,7 @@ export default function Dashboard() {
               const pnl = pos.pnl || 0
               const value = pos.current_value || 0
               const cost = pos.cost_basis || 0
+              const polyUrl = getPolymarketUrl(pos)
               
               return (
                 <div key={i} className={`p-3 rounded-lg border ${
@@ -451,9 +503,20 @@ export default function Dashboard() {
                 }`}>
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate text-gray-400">
-                        {formatShortMarket(pos.question || 'Unknown')}
-                      </div>
+                      {polyUrl ? (
+                        <a 
+                          href={polyUrl} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="text-sm font-medium truncate text-gray-400 hover:text-gray-200 hover:underline block"
+                        >
+                          {formatShortMarket(pos.question || 'Unknown')} ↗
+                        </a>
+                      ) : (
+                        <div className="text-sm font-medium truncate text-gray-400">
+                          {formatShortMarket(pos.question || 'Unknown')}
+                        </div>
+                      )}
                       <div className="flex flex-wrap items-center gap-2 mt-1">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                           side === 'YES' 
