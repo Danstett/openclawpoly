@@ -46,29 +46,31 @@ except ImportError:
 # =============================================================================
 
 CONFIG_SCHEMA = {
-    "entry_threshold": {"default": 0.05, "env": "SIMMER_SPRINT_ENTRY", "type": float,
-                        "help": "Min price divergence from 50¢ to trigger trade"},
-    "min_momentum_pct": {"default": 0.5, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
-                         "help": "Min BTC % move in lookback window to trigger"},
-    "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
+    "strategy": {"default": "value", "env": "SIMMER_STRATEGY", "type": str,
+                 "help": "Strategy type: 'value' (contrarian) or 'momentum'"},
+    "windows": {"default": ["15m", "5m"], "env": None, "type": list,
+                "help": "Market windows to scan (15m preferred, 5m backup)"},
+    "min_value_edge": {"default": 0.12, "env": "SIMMER_VALUE_EDGE", "type": float,
+                       "help": "Min edge from fair value to trigger trade (value strategy)"},
+    "max_price": {"default": 0.58, "env": "SIMMER_MAX_PRICE", "type": float,
+                  "help": "Max price to pay per share (buy low)"},
+    "min_price": {"default": 0.35, "env": "SIMMER_MIN_PRICE", "type": float,
+                  "help": "Min price to consider (avoid extreme cheap)"},
+    "max_position": {"default": 5.0, "env": "SIMMER_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
-    "max_price": {"default": 0.65, "env": "SIMMER_SPRINT_MAX_PRICE", "type": float,
-                  "help": "Max price to pay per share (don't buy above this)"},
-    "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
+    "signal_source": {"default": "binance", "env": "SIMMER_SIGNAL", "type": str,
                       "help": "Price feed source (binance, coingecko)"},
-    "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
+    "lookback_minutes": {"default": 3, "env": "SIMMER_LOOKBACK", "type": int,
                          "help": "Minutes of price history for momentum calc"},
-    "min_time_remaining": {"default": 60, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
-                           "help": "Skip fast_markets with less than this many seconds remaining"},
-    "max_time_remaining": {"default": 1800, "env": "SIMMER_SPRINT_MAX_TIME", "type": int,
-                           "help": "Skip fast_markets with more than this many seconds remaining (default 30 min)"},
-    "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
-              "help": "Asset to trade (BTC, ETH, SOL)"},
-    "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
-               "help": "Market window duration (5m or 15m)"},
-    "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
-                          "help": "Weight signal by volume (higher volume = more confident)"},
-    "daily_budget": {"default": 10.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
+    "min_time_remaining": {"default": 60, "env": "SIMMER_MIN_TIME", "type": int,
+                           "help": "Min seconds before expiry (late entry)"},
+    "max_time_remaining": {"default": 180, "env": "SIMMER_MAX_TIME", "type": int,
+                           "help": "Max seconds before expiry (late entry window)"},
+    "asset": {"default": "BTC", "env": "SIMMER_ASSET", "type": str,
+              "help": "Asset to trade (BTC only recommended)"},
+    "volume_confidence": {"default": False, "env": "SIMMER_VOL_CONF", "type": bool,
+                          "help": "Require volume confirmation"},
+    "daily_budget": {"default": 50.0, "env": "SIMMER_DAILY_BUDGET", "type": float,
                      "help": "Max total spend per UTC day"},
 }
 
@@ -143,20 +145,33 @@ def _update_config(updates, skill_file, config_filename="config.json"):
     return existing
 
 
-# Load config
+# Load config (with support for non-schema fields from config.json)
 cfg = _load_config(CONFIG_SCHEMA, __file__)
-ENTRY_THRESHOLD = cfg["entry_threshold"]
-MIN_MOMENTUM_PCT = cfg["min_momentum_pct"]
-MAX_POSITION_USD = cfg["max_position"]
-SIGNAL_SOURCE = cfg["signal_source"]
-LOOKBACK_MINUTES = cfg["lookback_minutes"]
-MIN_TIME_REMAINING = cfg["min_time_remaining"]
-MAX_TIME_REMAINING = cfg["max_time_remaining"]
-ASSET = cfg["asset"].upper()
-WINDOW = cfg["window"]  # "5m" or "15m"
-VOLUME_CONFIDENCE = cfg["volume_confidence"]
-DAILY_BUDGET = cfg["daily_budget"]
-MAX_PRICE = cfg.get("max_price", 0.65)  # Don't pay more than this per share
+
+# Load additional fields directly from config.json
+from pathlib import Path
+_config_path = Path(__file__).parent / "config.json"
+_raw_cfg = {}
+if _config_path.exists():
+    try:
+        with open(_config_path) as f:
+            _raw_cfg = json.load(f)
+    except:
+        pass
+
+STRATEGY = _raw_cfg.get("strategy", cfg.get("strategy", "value"))
+WINDOWS = _raw_cfg.get("windows", cfg.get("windows", ["15m", "5m"]))
+MIN_VALUE_EDGE = _raw_cfg.get("min_value_edge", cfg.get("min_value_edge", 0.12))
+MAX_PRICE = _raw_cfg.get("max_price", cfg.get("max_price", 0.58))
+MIN_PRICE = _raw_cfg.get("min_price", cfg.get("min_price", 0.35))
+MAX_POSITION_USD = _raw_cfg.get("max_position", cfg.get("max_position", 5.0))
+SIGNAL_SOURCE = _raw_cfg.get("signal_source", cfg.get("signal_source", "binance"))
+LOOKBACK_MINUTES = _raw_cfg.get("lookback_minutes", cfg.get("lookback_minutes", 3))
+MIN_TIME_REMAINING = _raw_cfg.get("min_time_remaining", cfg.get("min_time_remaining", 60))
+MAX_TIME_REMAINING = _raw_cfg.get("max_time_remaining", cfg.get("max_time_remaining", 180))
+ASSET = _raw_cfg.get("asset", cfg.get("asset", "BTC")).upper()
+VOLUME_CONFIDENCE = _raw_cfg.get("volume_confidence", cfg.get("volume_confidence", False))
+DAILY_BUDGET = _raw_cfg.get("daily_budget", cfg.get("daily_budget", 50.0))
 
 
 # =============================================================================
@@ -453,24 +468,88 @@ def _parse_fast_market_end_time(question):
         return None
 
 
+def discover_all_windows(asset="BTC", windows=None):
+    """Discover markets across multiple windows (15m and 5m).
+    
+    Returns markets sorted by preference (15m first, then by time remaining).
+    """
+    if windows is None:
+        windows = WINDOWS
+    
+    all_markets = []
+    for window in windows:
+        print(f"\n  Scanning {window} markets...")
+        markets = discover_fast_market_markets(asset, window)
+        for m in markets:
+            m["window"] = window  # Tag with window type
+        all_markets.extend(markets)
+    
+    return all_markets
+
+
 def find_best_fast_market(markets):
-    """Pick the best fast_market to trade: soonest expiring within time window."""
+    """Pick the best fast_market to trade based on VALUE strategy.
+    
+    For value strategy: Find markets with mispriced odds in our time window.
+    Prefer 15m markets over 5m (less bot-dominated).
+    Look for prices that offer good value (not too high, not too low).
+    """
     now = datetime.now(timezone.utc)
     candidates = []
+    
     for m in markets:
         end_time = m.get("end_time")
         if not end_time:
             continue
         remaining = (end_time - now).total_seconds()
-        # Only consider markets within the time window
-        if remaining > MIN_TIME_REMAINING and remaining < MAX_TIME_REMAINING:
-            candidates.append((remaining, m))
-
+        
+        # Only consider markets within the time window (late entry)
+        if remaining < MIN_TIME_REMAINING or remaining > MAX_TIME_REMAINING:
+            continue
+        
+        # Parse market prices
+        try:
+            prices = json.loads(m.get("outcome_prices", "[]"))
+            yes_price = float(prices[0]) if prices else 0.5
+            no_price = 1 - yes_price
+        except:
+            yes_price = 0.5
+            no_price = 0.5
+        
+        # Calculate value edge for both sides
+        # Fair value is 50¢ - any deviation is potential edge
+        yes_edge = 0.5 - yes_price  # Positive if YES is cheap
+        no_edge = 0.5 - no_price    # Positive if NO is cheap
+        
+        # Find the better value side
+        if yes_edge > no_edge and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
+            best_side = "yes"
+            best_price = yes_price
+            best_edge = yes_edge
+        elif no_price >= MIN_PRICE and no_price <= MAX_PRICE:
+            best_side = "no"
+            best_price = no_price
+            best_edge = no_edge
+        else:
+            continue  # Neither side offers good value
+        
+        # Only consider if edge is above threshold
+        if best_edge >= MIN_VALUE_EDGE:
+            # Score: prefer 15m over 5m, then by edge size
+            window_bonus = 100 if m.get("window") == "15m" else 0
+            score = window_bonus + (best_edge * 100)
+            
+            m["_best_side"] = best_side
+            m["_best_price"] = best_price
+            m["_best_edge"] = best_edge
+            candidates.append((score, remaining, m))
+    
     if not candidates:
         return None
-    # Sort by soonest expiring
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
+    
+    # Sort by score (highest first), then by soonest expiring
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates[0][2]
 
 
 # =============================================================================
@@ -668,23 +747,21 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if not quiet or force:
             print(msg)
 
-    log("⚡ Simmer FastLoop Trading Skill")
+    log("⚡ Simmer FastLoop Trading Skill (VALUE STRATEGY)")
     log("=" * 50)
 
     if dry_run:
         log("\n  [DRY RUN] No trades will be executed. Use --live to enable trading.")
 
     log(f"\n⚙️  Configuration:")
+    log(f"  Strategy:         {STRATEGY.upper()} (buy underpriced, contrarian)")
     log(f"  Asset:            {ASSET}")
-    log(f"  Window:           {WINDOW}")
-    log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
-    log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
+    log(f"  Windows:          {', '.join(WINDOWS)} (15m preferred)")
+    log(f"  Value edge:       {MIN_VALUE_EDGE:.0%} min (how cheap must it be)")
+    log(f"  Price range:      ${MIN_PRICE:.2f} - ${MAX_PRICE:.2f} (buy zone)")
     log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
-    log(f"  Max price:        ${MAX_PRICE:.2f} (won't pay more per share)")
+    log(f"  Entry window:     {MIN_TIME_REMAINING}s - {MAX_TIME_REMAINING}s before expiry (late entry)")
     log(f"  Signal source:    {SIGNAL_SOURCE}")
-    log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
-    log(f"  Time window:      {MIN_TIME_REMAINING}s - {MAX_TIME_REMAINING}s before expiry")
-    log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
     daily_spend = _load_daily_spend(__file__)
     log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
 
@@ -723,10 +800,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if portfolio and not portfolio.get("error"):
             log(f"  Balance: ${portfolio.get('balance_usdc', 0):.2f}")
 
-    # Step 1: Discover fast markets
-    log(f"\n🔍 Discovering {ASSET} fast markets...")
-    markets = discover_fast_market_markets(ASSET, WINDOW)
-    log(f"  Found {len(markets)} active fast markets")
+    # Step 1: Discover fast markets across all windows
+    log(f"\n🔍 Discovering {ASSET} fast markets ({', '.join(WINDOWS)})...")
+    markets = discover_all_windows(ASSET, WINDOWS)
+    log(f"\n  Found {len(markets)} total active markets")
 
     if not markets:
         log("  No active fast markets found")
@@ -757,99 +834,90 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     end_time = best.get("end_time")
     remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+    window_type = best.get("window", "5m")
+    
     log(f"\n🎯 Selected: {best['question']}")
-    log(f"  Expires in: {remaining:.0f}s")
+    log(f"  Window:     {window_type}")
+    log(f"  Expires in: {remaining:.0f}s ({remaining/60:.1f} min)")
 
-    # Parse current market odds
+    # Get pre-calculated value analysis from find_best_fast_market
+    side = best.get("_best_side", "yes")
+    price = best.get("_best_price", 0.5)
+    value_edge = best.get("_best_edge", 0)
+    
+    # Parse market odds for display
     try:
         prices = json.loads(best.get("outcome_prices", "[]"))
         market_yes_price = float(prices[0]) if prices else 0.5
     except (json.JSONDecodeError, IndexError, ValueError):
         market_yes_price = 0.5
-    log(f"  Current YES price: ${market_yes_price:.3f}")
+    
+    log(f"  YES price:  ${market_yes_price:.3f}")
+    log(f"  NO price:   ${1-market_yes_price:.3f}")
+    log(f"  Best side:  {side.upper()} @ ${price:.3f}")
+    log(f"  Value edge: {value_edge:.1%} (fair=50¢)")
 
     # Fee info (fast markets charge 10% on winnings)
     fee_rate_bps = best.get("fee_rate_bps", 0)
     fee_rate = fee_rate_bps / 10000  # 1000 bps -> 0.10
     if fee_rate > 0:
-        log(f"  Fee rate:         {fee_rate:.0%} (Polymarket fast market fee)")
+        log(f"  Fee rate:   {fee_rate:.0%} (Polymarket fast market fee)")
 
-    # Step 3: Get CEX price momentum
-    log(f"\n📈 Fetching {ASSET} price signal ({SIGNAL_SOURCE})...")
+    # Step 3: Get CEX price for sanity check (optional)
+    log(f"\n📈 Fetching {ASSET} price ({SIGNAL_SOURCE}) for sanity check...")
     momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
 
-    if not momentum:
-        log("  ❌ Failed to fetch price data", force=True)
-        return
-
-    log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
-    log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
-    log(f"  Direction: {momentum['direction']}")
-    if VOLUME_CONFIDENCE:
-        log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
-
-    # Step 4: Decision logic
-    log(f"\n🧠 Analyzing...")
-
-    momentum_pct = abs(momentum["momentum_pct"])
-    direction = momentum["direction"]
-
-    # Check minimum momentum
-    if momentum_pct < MIN_MOMENTUM_PCT:
-        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
-        if not quiet:
-            print(f"📊 Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
-        return
-
-    # Calculate expected fair price based on momentum direction
-    # Simple model: strong momentum → higher probability of continuation
-    if direction == "up":
-        side = "yes"
-        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
-        trade_rationale = f"{ASSET} up {momentum['momentum_pct']:+.3f}% but YES only ${market_yes_price:.3f}"
+    if momentum:
+        log(f"  Price: ${momentum['price_now']:,.2f}")
+        log(f"  Recent move: {momentum['momentum_pct']:+.3f}%")
+        
+        # VALUE STRATEGY: We're betting AGAINST extreme momentum
+        # If BTC moved a lot and we're buying the cheap side, that's good value
+        direction = momentum["direction"]
+        momentum_pct = abs(momentum["momentum_pct"])
+        
+        # Contrarian check: warn if betting with strong momentum (not contrarian)
+        if momentum_pct > 0.3:
+            if (direction == "up" and side == "yes") or (direction == "down" and side == "no"):
+                log(f"  ⚠️  Warning: betting WITH momentum (not contrarian)")
+            else:
+                log(f"  ✓ Contrarian bet: {side.upper()} against {direction} momentum")
     else:
-        side = "no"
-        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
-        trade_rationale = f"{ASSET} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
+        log("  ⚠️ Could not fetch CEX price (proceeding with value signal)")
 
-    # Volume confidence adjustment
-    vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.5:
-        log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
+    # Step 4: Decision logic for VALUE strategy
+    log(f"\n🧠 VALUE Strategy Analysis...")
+    
+    # The value edge was already validated in find_best_fast_market
+    # But let's double-check and explain the trade
+    if value_edge < MIN_VALUE_EDGE:
+        log(f"  ⏸️  Value edge {value_edge:.1%} < minimum {MIN_VALUE_EDGE:.1%} — skip")
         if not quiet:
-            print(f"📊 Summary: No trade (low volume)")
+            print(f"📊 Summary: No trade (insufficient value edge)")
         return
-    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
-        vol_note = f" 📊 (high volume: {momentum['volume_ratio']:.1f}x avg)"
-
-    # Check divergence threshold
-    if divergence <= 0:
-        log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
-        if not quiet:
-            print(f"📊 Summary: No trade (market already priced in)")
-        return
-
-    # Fee-aware EV check: require enough divergence to cover fees
+    
+    # Fee-aware EV check
     if fee_rate > 0:
-        buy_price = market_yes_price if side == "yes" else (1 - market_yes_price)
-        win_profit = (1 - buy_price) * (1 - fee_rate)
-        breakeven = buy_price / (win_profit + buy_price)
-        fee_penalty = breakeven - 0.50  # how much fees shift breakeven above 50%
-        min_divergence = fee_penalty + 0.02  # plus buffer
-        log(f"  Breakeven:        {breakeven:.1%} win rate (fee-adjusted, min divergence {min_divergence:.3f})")
-        if divergence < min_divergence:
-            log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
+        win_profit = (1 - price) * (1 - fee_rate)
+        breakeven = price / (win_profit + price)
+        log(f"  Breakeven: {breakeven:.1%} win rate needed (fee-adjusted)")
+        
+        # For value strategy, we need edge to overcome fees
+        required_edge = breakeven - 0.50 + 0.02  # 2% buffer
+        if value_edge < required_edge:
+            log(f"  ⏸️  Value edge {value_edge:.1%} < fee-adjusted minimum {required_edge:.1%} — skip")
             if not quiet:
                 print(f"📊 Summary: No trade (fees eat the edge)")
             return
+    
+    trade_rationale = f"VALUE: {side.upper()} at ${price:.2f} has {value_edge:.0%} edge from fair (50¢)"
 
-    # We have a signal!
+    # We have a value signal!
     position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
-    price = market_yes_price if side == "yes" else (1 - market_yes_price)
-
-    # Max price check - don't pay more than MAX_PRICE per share
-    if price > MAX_PRICE:
-        log(f"  ⏸️  Price ${price:.2f} > max allowed ${MAX_PRICE:.2f} — skip (bad odds)")
+    
+    # Price already validated in find_best_fast_market, but double-check
+    if price > MAX_PRICE or price < MIN_PRICE:
+        log(f"  ⏸️  Price ${price:.2f} outside range ${MIN_PRICE:.2f}-${MAX_PRICE:.2f} — skip")
         if not quiet:
             print(f"📊 Summary: No trade (price too high: ${price:.2f})")
         return
@@ -890,8 +958,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
             return
 
-    log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
-    log(f"  Divergence: {divergence:.3f}", force=True)
+    log(f"  ✅ Signal: {side.upper()} — {trade_rationale}", force=True)
+    log(f"  Value edge: {value_edge:.1%}", force=True)
 
     # Step 5: Import & Trade
     log(f"\n🔗 Importing to Simmer...", force=True)
@@ -926,15 +994,15 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
             # Log to trade journal
             if trade_id and JOURNAL_AVAILABLE:
-                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+                confidence = min(0.9, 0.5 + value_edge)
                 log_trade(
                     trade_id=trade_id,
                     source=TRADE_SOURCE,
                     thesis=trade_rationale,
                     confidence=round(confidence, 2),
                     asset=ASSET,
-                    momentum_pct=round(momentum["momentum_pct"], 3),
-                    volume_ratio=round(momentum["volume_ratio"], 2),
+                    momentum_pct=round(momentum["momentum_pct"], 3) if momentum else 0,
+                    volume_ratio=round(momentum["volume_ratio"], 2) if momentum else 1,
                     signal_source=SIGNAL_SOURCE,
                 )
         else:
@@ -948,8 +1016,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     show_summary = not quiet or total_trades > 0
     if show_summary:
         print(f"\n📊 Summary:")
-        print(f"  Sprint: {best['question'][:50]}")
-        print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
+        print(f"  Market: {best['question'][:50]}")
+        print(f"  Strategy: VALUE | {side.upper()} @ ${price:.2f} | Edge: {value_edge:.0%}")
         print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
 
 
