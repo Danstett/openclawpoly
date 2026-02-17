@@ -765,6 +765,10 @@ if __name__ == "__main__":
     parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio-based position sizing")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Only output on trades/errors (ideal for high-frequency runs)")
+    parser.add_argument("--loop", action="store_true",
+                        help="Run continuously (for deployment). Also enabled by LOOP=1 env var.")
+    parser.add_argument("--interval", type=int, default=60,
+                        help="Seconds between runs in loop mode (default: 60)")
     args = parser.parse_args()
 
     if args.set:
@@ -793,11 +797,36 @@ if __name__ == "__main__":
         sys.exit(0)
 
     dry_run = not args.live
-
-    run_fast_market_strategy(
-        dry_run=dry_run,
-        positions_only=args.positions,
-        show_config=args.config,
-        smart_sizing=args.smart_sizing,
-        quiet=args.quiet,
-    )
+    
+    # Check for loop mode (CLI flag or env var)
+    loop_mode = args.loop or os.environ.get("LOOP", "").lower() in ("1", "true", "yes")
+    interval = int(os.environ.get("LOOP_INTERVAL", args.interval))
+    
+    if loop_mode:
+        import time
+        print(f"🔄 Running in loop mode (interval: {interval}s)")
+        print("=" * 50)
+        run_count = 0
+        while True:
+            run_count += 1
+            print(f"\n--- Run #{run_count} @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
+            try:
+                run_fast_market_strategy(
+                    dry_run=dry_run,
+                    positions_only=args.positions,
+                    show_config=args.config,
+                    smart_sizing=args.smart_sizing,
+                    quiet=args.quiet,
+                )
+            except Exception as e:
+                print(f"❌ Error in run #{run_count}: {e}")
+            print(f"\n⏳ Sleeping {interval}s...")
+            time.sleep(interval)
+    else:
+        run_fast_market_strategy(
+            dry_run=dry_run,
+            positions_only=args.positions,
+            show_config=args.config,
+            smart_sizing=args.smart_sizing,
+            quiet=args.quiet,
+        )
