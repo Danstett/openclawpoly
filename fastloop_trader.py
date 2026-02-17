@@ -244,21 +244,12 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
     """Find active fast markets on Polymarket via Gamma API."""
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     
-    # Try multiple queries to find markets expiring soon
-    # 1. Sort by endDate ascending to get soonest-expiring first
-    # 2. Increase limit to catch more markets
+    # Query for crypto markets, sorted by newest created
     url = (
         "https://gamma-api.polymarket.com/markets"
-        "?limit=50&closed=false&active=true&order=endDate&ascending=true"
+        "?limit=50&closed=false&tag=crypto&order=createdAt&ascending=false"
     )
     result = _api_request(url)
-    if not result or isinstance(result, dict) and result.get("error"):
-        # Fallback to original query
-        url = (
-            "https://gamma-api.polymarket.com/markets"
-            "?limit=50&closed=false&tag=crypto&order=createdAt&ascending=false"
-        )
-        result = _api_request(url)
     
     if not result or isinstance(result, dict) and result.get("error"):
         return []
