@@ -240,6 +240,108 @@ def simmer_request(path, method="GET", data=None, api_key=None):
 
 
 # =============================================================================
+# Slack Notifications
+# =============================================================================
+
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+
+
+def send_slack_notification(message, emoji="🤖"):
+    """Send a notification to Slack webhook."""
+    if not SLACK_WEBHOOK_URL:
+        return  # Slack not configured, silently skip
+    
+    try:
+        payload = {
+            "text": f"{emoji} *FastLoop Bot*\n{message}",
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(
+            SLACK_WEBHOOK_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urlopen(req, timeout=10) as resp:
+            pass  # Success
+    except Exception as e:
+        print(f"  ⚠️ Slack notification failed: {e}")
+
+
+def notify_trade(side, shares, price, market_question, pnl_potential=None):
+    """Send Slack notification for a new trade."""
+    short_market = market_question[:50] if len(market_question) > 50 else market_question
+    cost = shares * price
+    msg = f"📈 *New Trade*\n"
+    msg += f"• Market: {short_market}\n"
+    msg += f"• Side: *{side.upper()}*\n"
+    msg += f"• Shares: {shares:.1f} @ ${price:.2f}\n"
+    msg += f"• Cost: ${cost:.2f}"
+    if pnl_potential:
+        msg += f"\n• Potential profit: ${pnl_potential:.2f}"
+    send_slack_notification(msg, "📈")
+
+
+def notify_redeemable(positions):
+    """Send Slack notification for redeemable positions."""
+    if not positions:
+        return
+    
+    total_value = sum(p.get("current_value", 0) for p in positions)
+    msg = f"🎉 *Positions Ready to Redeem!*\n"
+    msg += f"• Count: {len(positions)} position(s)\n"
+    msg += f"• Total value: *${total_value:.2f}*\n\n"
+    
+    for p in positions[:5]:  # Max 5 positions in message
+        question = p.get("question", "Unknown")[:40]
+        value = p.get("current_value", 0)
+        msg += f"  • {question}... (${value:.2f})\n"
+    
+    if len(positions) > 5:
+        msg += f"  ... and {len(positions) - 5} more\n"
+    
+    msg += "\n_Redeem at: simmer.markets/dashboard_"
+    send_slack_notification(msg, "🎉")
+
+
+def check_and_notify_redeemable(api_key):
+    """Check for redeemable positions and notify once per position."""
+    positions = get_positions(api_key)
+    redeemable = [p for p in positions if p.get("redeemable") == True]
+    
+    if not redeemable:
+        return
+    
+    # Track which positions we've already notified about
+    notified_path = _get_spend_path(__file__).parent / "notified_redeemable.json"
+    notified_ids = set()
+    
+    if notified_path.exists():
+        try:
+            with open(notified_path) as f:
+                notified_ids = set(json.load(f))
+        except (json.JSONDecodeError, IOError):
+            pass
+    
+    # Find new redeemable positions
+    new_redeemable = []
+    for p in redeemable:
+        # Use question as ID since market_id might not be available
+        pos_id = p.get("market_id") or p.get("question", "")[:50]
+        if pos_id and pos_id not in notified_ids:
+            new_redeemable.append(p)
+            notified_ids.add(pos_id)
+    
+    if new_redeemable:
+        notify_redeemable(new_redeemable)
+        # Save updated notified IDs
+        with open(notified_path, "w") as f:
+            json.dump(list(notified_ids), f)
+
+
+# =============================================================================
 # Sprint Market Discovery
 # =============================================================================
 
@@ -597,6 +699,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     api_key = get_api_key()
 
+    # Check for redeemable positions and notify (only once per position)
+    if not dry_run:
+        check_and_notify_redeemable(api_key)
+
     # Show positions if requested
     if positions_only:
         log("\n📊 Sprint Positions:")
@@ -814,6 +920,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             daily_spend["trades"] += 1
             _save_daily_spend(__file__, daily_spend)
 
+            # Send Slack notification
+            potential_profit = shares * (1 - price) * 0.9  # 10% fee on winnings
+            notify_trade(side, shares, price, best["question"], potential_profit)
+
             # Log to trade journal
             if trade_id and JOURNAL_AVAILABLE:
                 confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
@@ -830,6 +940,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         else:
             error = result.get("error", "Unknown error") if result else "No response"
             log(f"  ❌ Trade failed: {error}", force=True)
+            # Notify on trade failure too
+            send_slack_notification(f"❌ *Trade Failed*\n• Market: {best['question'][:40]}...\n• Error: {error}", "❌")
 
     # Summary
     total_trades = 0 if dry_run else (1 if result and result.get("success") else 0)
