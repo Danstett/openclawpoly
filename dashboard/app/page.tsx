@@ -160,6 +160,22 @@ export default function Dashboard() {
     (p.question || '').toLowerCase().includes('up or down')
   )
 
+  // Categorize positions
+  const redeemablePositions = fastPositions.filter(p => p.redeemable === true)
+  const pendingPositions = fastPositions.filter(p => {
+    if (p.redeemable) return false
+    const resolveTime = p.resolves_at ? new Date(p.resolves_at) : null
+    return resolveTime && resolveTime > new Date()
+  })
+  const resolvedPositions = fastPositions.filter(p => {
+    if (p.redeemable) return false
+    const resolveTime = p.resolves_at ? new Date(p.resolves_at) : null
+    return !resolveTime || resolveTime <= new Date()
+  })
+
+  // Calculate redeemable value
+  const redeemableValue = redeemablePositions.reduce((sum, p) => sum + (p.current_value || 0), 0)
+
   // Get totals from API
   const totalValue = positionsData?.total_value || 0
   const totalPnL = portfolio?.pnl_total || positionsData?.polymarket_pnl || 0
@@ -259,7 +275,7 @@ export default function Dashboard() {
       )}
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4 mb-6">
         <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
           <div className="text-xs text-gray-500 mb-1">Wallet Balance</div>
           <div className="text-xl font-bold text-green-400">
@@ -278,39 +294,45 @@ export default function Dashboard() {
             {formatPnL(totalPnL)}
           </div>
         </div>
+        <div className="bg-gray-900 border border-yellow-700 rounded-lg p-4">
+          <div className="text-xs text-yellow-500 mb-1">To Redeem</div>
+          <div className="text-xl font-bold text-yellow-400">
+            {formatCurrency(redeemableValue)}
+          </div>
+          <div className="text-xs text-yellow-600">{redeemablePositions.length} position{redeemablePositions.length !== 1 ? 's' : ''}</div>
+        </div>
         <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-          <div className="text-xs text-gray-500 mb-1">Positions</div>
-          <div className="text-xl font-bold text-white">
-            {fastPositions.length}
+          <div className="text-xs text-gray-500 mb-1">Pending</div>
+          <div className="text-xl font-bold text-blue-400">
+            {pendingPositions.length}
           </div>
         </div>
       </div>
 
-      {/* Positions */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
-        <h2 className="text-lg font-semibold mb-4">Positions</h2>
-        {fastPositions.length === 0 ? (
-          <p className="text-gray-500 text-sm">No positions</p>
-        ) : (
+      {/* Redeemable Positions */}
+      {redeemablePositions.length > 0 && (
+        <div className="bg-gray-900 border border-yellow-700 rounded-lg p-4 mb-6">
+          <h2 className="text-lg font-semibold mb-2 text-yellow-400 flex items-center gap-2">
+            <span>🎉 Ready to Redeem</span>
+            <span className="text-sm font-normal text-yellow-600">({formatCurrency(redeemableValue)} total)</span>
+          </h2>
+          <p className="text-xs text-yellow-600 mb-4">These positions have won and can be redeemed for USDC</p>
           <div className="space-y-2">
-            {fastPositions.map((pos, i) => {
-              const status = getPositionStatus(pos)
+            {redeemablePositions.map((pos, i) => {
               const side = getPositionSide(pos)
               const shares = getPositionShares(pos)
               const pnl = pos.pnl || 0
               const value = pos.current_value || 0
               const cost = pos.cost_basis || 0
-              const avgPrice = pos.avg_cost || 0
               
               return (
-                <div key={i} className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
+                <div key={i} className="p-3 rounded-lg bg-yellow-900/20 border border-yellow-700/50">
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate">
+                      <div className="text-sm font-medium truncate text-yellow-100">
                         {formatShortMarket(pos.question || 'Unknown')}
                       </div>
                       <div className="flex flex-wrap items-center gap-2 mt-1">
-                        {/* Side badge */}
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                           side === 'YES' 
                             ? 'bg-green-900/50 text-green-400' 
@@ -318,18 +340,138 @@ export default function Dashboard() {
                         }`}>
                           {side}
                         </span>
-                        {/* Status badge */}
-                        <span className={`px-2 py-0.5 rounded text-xs font-medium border ${getStatusBadge(status)}`}>
-                          {status === 'REDEEMABLE' ? 'WON - REDEEM' : status}
+                        <span className="px-2 py-0.5 rounded text-xs font-medium border bg-yellow-900/50 text-yellow-400 border-yellow-700">
+                          WON
                         </span>
-                        {/* Shares info */}
-                        <span className="text-xs text-gray-400">
-                          {shares.toFixed(1)} @ {(avgPrice * 100).toFixed(0)}¢
+                        <span className="text-xs text-yellow-500">
+                          {shares.toFixed(1)} shares
                         </span>
                       </div>
                     </div>
                     <div className="text-right">
+                      <div className="text-sm font-bold text-yellow-400">{formatCurrency(value)}</div>
+                      <div className="text-xs font-medium text-green-400">
+                        {formatPnL(pnl)} profit
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        cost: {formatCurrency(cost)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Pending Positions */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
+        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <span>⏳ Pending Positions</span>
+          <span className="text-sm font-normal text-gray-500">({pendingPositions.length})</span>
+        </h2>
+        {pendingPositions.length === 0 ? (
+          <p className="text-gray-500 text-sm">No pending positions</p>
+        ) : (
+          <div className="space-y-2">
+            {pendingPositions.map((pos, i) => {
+              const side = getPositionSide(pos)
+              const shares = getPositionShares(pos)
+              const value = pos.current_value || 0
+              const cost = pos.cost_basis || 0
+              const avgPrice = pos.avg_cost || 0
+              const resolveTime = pos.resolves_at ? new Date(pos.resolves_at) : null
+              
+              return (
+                <div key={i} className="p-3 rounded-lg bg-blue-900/20 border border-blue-800/50">
+                  <div className="flex justify-between items-start gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">
+                        {formatShortMarket(pos.question || 'Unknown')}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 mt-1">
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          side === 'YES' 
+                            ? 'bg-green-900/50 text-green-400' 
+                            : 'bg-red-900/50 text-red-400'
+                        }`}>
+                          {side}
+                        </span>
+                        <span className="px-2 py-0.5 rounded text-xs font-medium border bg-blue-900/50 text-blue-400 border-blue-700">
+                          PENDING
+                        </span>
+                        <span className="text-xs text-gray-400">
+                          {shares.toFixed(1)} @ {(avgPrice * 100).toFixed(0)}¢
+                        </span>
+                        {resolveTime && (
+                          <span className="text-xs text-blue-400">
+                            resolves {resolveTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="text-right">
                       <div className="text-sm font-medium">{formatCurrency(value)}</div>
+                      <div className="text-xs text-gray-500">
+                        cost: {formatCurrency(cost)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Resolved Positions (Won/Lost/Redeemed) */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
+        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <span>📊 Resolved Positions</span>
+          <span className="text-sm font-normal text-gray-500">({resolvedPositions.length})</span>
+        </h2>
+        {resolvedPositions.length === 0 ? (
+          <p className="text-gray-500 text-sm">No resolved positions yet</p>
+        ) : (
+          <div className="space-y-2">
+            {resolvedPositions.map((pos, i) => {
+              const status = getPositionStatus(pos)
+              const side = getPositionSide(pos)
+              const shares = getPositionShares(pos)
+              const pnl = pos.pnl || 0
+              const value = pos.current_value || 0
+              const cost = pos.cost_basis || 0
+              
+              return (
+                <div key={i} className={`p-3 rounded-lg border ${
+                  status === 'WON' 
+                    ? 'bg-green-900/10 border-green-800/50' 
+                    : 'bg-red-900/10 border-red-800/50'
+                }`}>
+                  <div className="flex justify-between items-start gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate text-gray-400">
+                        {formatShortMarket(pos.question || 'Unknown')}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 mt-1">
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          side === 'YES' 
+                            ? 'bg-green-900/50 text-green-400' 
+                            : 'bg-red-900/50 text-red-400'
+                        }`}>
+                          {side}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium border ${getStatusBadge(status)}`}>
+                          {status}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {shares.toFixed(1)} shares
+                        </span>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-sm font-medium text-gray-400">{formatCurrency(value)}</div>
                       <div className={`text-xs font-medium ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                         {formatPnL(pnl)}
                       </div>
