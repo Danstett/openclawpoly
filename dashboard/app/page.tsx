@@ -173,19 +173,23 @@ export default function Dashboard() {
   }
 
   // Helper to get trade details regardless of field names
-  const getTradeDetails = (trade: Trade) => {
+  const getTradeDetails = (trade: any) => {
     const id = trade.id || trade.trade_id || trade.tradeId || ''
-    const question = trade.question || trade.title || trade.market_id || trade.marketId || 'Unknown'
+    const question = trade.market_question || trade.question || trade.title || trade.market_id || trade.marketId || 'Unknown'
     const side = trade.side || trade.outcome || '?'
-    const amount = trade.amount || trade.cost || 0
+    const action = trade.action || 'buy'
+    const cost = trade.cost || trade.amount || 0
     const shares = trade.shares || trade.shares_bought || trade.sharesBought || 0
-    const price = trade.price || trade.avg_price || (shares > 0 ? amount / shares : 0)
+    const priceBefore = trade.price_before || trade.price || 0
+    const priceAfter = trade.price_after || trade.price || 0
+    const price = priceBefore || (shares > 0 ? cost / shares : 0)
     const timestamp = trade.created_at || trade.createdAt || trade.timestamp || ''
     const pnl = trade.pnl || trade.profit
     const isResolved = trade.resolved ?? false
     const won = trade.won
+    const source = trade.source || ''
     
-    return { id, question, side, amount, shares, price, timestamp, pnl, isResolved, won }
+    return { id, question, side, action, cost, shares, price, priceBefore, priceAfter, timestamp, pnl, isResolved, won, source }
   }
 
   // Filter for fast market positions
@@ -361,8 +365,11 @@ export default function Dashboard() {
           <p className="text-gray-500">No recent trades</p>
         ) : (
           <div className="space-y-2">
-            {fastTrades.slice(0, 20).map((trade, i) => {
-              const { id, question, side, amount, shares, price, timestamp, pnl, isResolved, won } = getTradeDetails(trade)
+            {fastTrades
+              .filter(t => getTradeDetails(t).shares > 0) // Only show trades with actual shares
+              .slice(0, 20)
+              .map((trade, i) => {
+              const { id, question, side, action, cost, shares, price, timestamp, pnl, isResolved, won } = getTradeDetails(trade)
               return (
                 <div key={i} className={`p-3 rounded-lg border ${isResolved ? 'bg-gray-800/30 border-gray-700' : 'bg-gray-800/50 border-gray-700'}`}>
                   <div className="flex justify-between items-start gap-2">
@@ -370,11 +377,12 @@ export default function Dashboard() {
                       <div className="text-sm truncate">{question}</div>
                       <div className="flex items-center gap-2 mt-1">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          action === 'sell' ? 'bg-yellow-900/50 text-yellow-400' :
                           side.toLowerCase() === 'yes' || side.toLowerCase() === 'up' 
                             ? 'bg-green-900/50 text-green-400' 
                             : 'bg-red-900/50 text-red-400'
                         }`}>
-                          {side.toUpperCase()}
+                          {action === 'sell' ? 'SELL' : side.toUpperCase()}
                         </span>
                         <span className="text-xs text-gray-500">{formatShortTime(timestamp)}</span>
                         {isResolved && won !== undefined && (
@@ -385,9 +393,9 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="text-right">
-                      <div className="text-sm">{formatCurrency(amount)}</div>
-                      <div className="text-xs text-gray-400">{shares.toFixed(1)} @ {formatCurrency(price)}</div>
-                      {pnl !== undefined && (
+                      <div className="text-sm font-medium">{formatCurrency(cost)}</div>
+                      <div className="text-xs text-gray-400">{shares.toFixed(1)} shares @ {(price * 100).toFixed(0)}¢</div>
+                      {pnl !== undefined && pnl !== 0 && (
                         <div className={`text-xs ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                           {formatCurrency(pnl)}
                         </div>
