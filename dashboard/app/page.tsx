@@ -3,73 +3,64 @@
 import { useEffect, useState, useCallback } from 'react'
 
 interface Position {
-  // Support multiple field name formats from API
-  question?: string
-  title?: string
   market_id?: string
-  marketId?: string
-  side?: string
-  outcome?: string
-  shares?: number
+  question?: string
   shares_yes?: number
   shares_no?: number
-  sharesYes?: number
-  sharesNo?: number
-  avg_price?: number
-  avgPrice?: number
-  average_price?: number
-  avg_price_yes?: number
-  avg_price_no?: number
   current_price?: number
-  currentPrice?: number
-  current_price_yes?: number
-  current_price_no?: number
-  value?: number
-  cost?: number
+  current_probability?: number
+  current_value?: number
+  cost_basis?: number
+  avg_cost?: number
   pnl?: number
-  profit?: number
-  pnl_percent?: number
-  resolved?: boolean
-  won?: boolean
+  venue?: string
+  resolves_at?: string
+  redeemable?: boolean
+  redeemable_side?: string | null
+  sources?: string[]
 }
 
 interface Trade {
   id?: string
-  trade_id?: string
-  tradeId?: string
   market_id?: string
-  marketId?: string
-  question?: string
-  title?: string
+  market_question?: string
   side?: string
-  outcome?: string
-  amount?: number
-  cost?: number
+  action?: string
   shares?: number
-  shares_bought?: number
-  sharesBought?: number
-  price?: number
-  avg_price?: number
+  cost?: number
+  price_before?: number
+  price_after?: number
   created_at?: string
-  createdAt?: string
-  timestamp?: string
+  venue?: string
   source?: string
-  pnl?: number
-  profit?: number
-  resolved?: boolean
-  won?: boolean
+  reasoning?: string
+}
+
+interface Portfolio {
+  balance_usdc?: number
+  total_exposure?: number
+  positions_count?: number
+  pnl_total?: number
+  pnl_24h?: number
+}
+
+interface PositionsResponse {
+  positions?: Position[]
+  total_value?: number
+  polymarket_pnl?: number
 }
 
 interface ApiLog {
   timestamp: string
   endpoint: string
   status: string
-  data?: any
 }
 
+type PositionStatus = 'WON' | 'LOST' | 'PENDING' | 'REDEEMABLE'
+
 export default function Dashboard() {
-  const [balance, setBalance] = useState<number>(0)
-  const [positions, setPositions] = useState<Position[]>([])
+  const [portfolio, setPortfolio] = useState<Portfolio | null>(null)
+  const [positionsData, setPositionsData] = useState<PositionsResponse | null>(null)
   const [trades, setTrades] = useState<Trade[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -78,72 +69,51 @@ export default function Dashboard() {
   const [showDebug, setShowDebug] = useState(false)
   const [rawData, setRawData] = useState<any>({})
 
-  const addLog = useCallback((endpoint: string, status: string, data?: any) => {
+  const addLog = useCallback((endpoint: string, status: string) => {
     setApiLogs(prev => [{
       timestamp: new Date().toLocaleTimeString(),
       endpoint,
       status,
-      data
     }, ...prev.slice(0, 19)])
   }, [])
 
   const fetchData = useCallback(async () => {
     try {
-      // Fetch all data in parallel
       const [portfolioRes, positionsRes, historyRes] = await Promise.all([
         fetch('/api/portfolio'),
         fetch('/api/positions'),
         fetch('/api/history'),
       ])
 
-      const portfolioData = await portfolioRes.json()
-      const positionsData = await positionsRes.json()
-      const historyData = await historyRes.json()
+      const portfolioJson = await portfolioRes.json()
+      const positionsJson = await positionsRes.json()
+      const historyJson = await historyRes.json()
 
-      // Store raw data for debugging
-      setRawData({ portfolio: portfolioData, positions: positionsData, history: historyData })
+      setRawData({ portfolio: portfolioJson, positions: positionsJson, history: historyJson })
 
-      // Log API responses
-      addLog('/api/portfolio', portfolioRes.ok ? 'OK' : 'ERROR', portfolioData)
-      addLog('/api/positions', positionsRes.ok ? 'OK' : 'ERROR', positionsData)
-      addLog('/api/history', historyRes.ok ? 'OK' : 'ERROR', historyData)
+      addLog('/api/portfolio', portfolioRes.ok ? 'OK' : 'ERROR')
+      addLog('/api/positions', positionsRes.ok ? 'OK' : 'ERROR')
+      addLog('/api/history', historyRes.ok ? 'OK' : 'ERROR')
 
-      // Extract balance (try multiple field names)
-      const bal = portfolioData?.balance_usdc ?? portfolioData?.balance ?? portfolioData?.balanceUsdc ?? 0
-      setBalance(bal)
-
-      if (portfolioData?.error) {
-        setError(portfolioData.error)
-      } else {
+      // Set portfolio (handle error responses)
+      if (!portfolioJson?.error) {
+        setPortfolio(portfolioJson)
         setError(null)
+      } else {
+        setError(typeof portfolioJson.error === 'string' ? portfolioJson.error : 'API Error')
       }
 
-      // Extract positions (handle different response formats)
-      let posArray: Position[] = []
-      if (Array.isArray(positionsData)) {
-        posArray = positionsData
-      } else if (positionsData?.positions) {
-        posArray = positionsData.positions
-      } else if (positionsData?.data) {
-        posArray = positionsData.data
-      }
-      setPositions(posArray)
+      // Set positions
+      setPositionsData(positionsJson)
 
-      // Extract trades (handle different response formats)
-      let tradesArray: Trade[] = []
-      if (Array.isArray(historyData)) {
-        tradesArray = historyData
-      } else if (historyData?.trades) {
-        tradesArray = historyData.trades
-      } else if (historyData?.data) {
-        tradesArray = historyData.data
-      }
-      setTrades(tradesArray)
+      // Set trades
+      const tradesArray = historyJson?.trades || []
+      setTrades(Array.isArray(tradesArray) ? tradesArray : [])
 
       setLastUpdated(new Date())
     } catch (err) {
       setError(String(err))
-      addLog('fetch', 'ERROR', String(err))
+      addLog('fetch', 'ERROR')
     } finally {
       setLoading(false)
     }
@@ -151,92 +121,79 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchData()
-    const interval = setInterval(fetchData, 60000) // Refresh every 60s (rate limit: 6/min)
+    const interval = setInterval(fetchData, 60000)
     return () => clearInterval(interval)
   }, [fetchData])
 
-  // Helper to get position details regardless of field names
-  const getPositionDetails = (pos: Position) => {
-    const question = pos.question || pos.title || 'Unknown Market'
-    const side = pos.side || pos.outcome || (pos.shares_yes || pos.sharesYes ? 'yes' : 'no')
-    const shares = pos.shares || pos.shares_yes || pos.shares_no || pos.sharesYes || pos.sharesNo || 0
-    const avgPrice = pos.avg_price || pos.avgPrice || pos.average_price || pos.avg_price_yes || pos.avg_price_no || 0
-    const currentPrice = pos.current_price || pos.currentPrice || pos.current_price_yes || pos.current_price_no || avgPrice
-    const value = pos.value || pos.cost || (shares * currentPrice) || 0
-    const cost = pos.cost || (shares * avgPrice) || 0
-    const pnl = pos.pnl || pos.profit || (value - cost) || 0
-    const pnlPercent = pos.pnl_percent || (cost > 0 ? ((pnl / cost) * 100) : 0)
-    const isResolved = pos.resolved ?? false
-    const won = pos.won
+  // Get position status
+  const getPositionStatus = (pos: Position): PositionStatus => {
+    if (pos.redeemable) return 'REDEEMABLE'
     
-    return { question, side, shares, avgPrice, currentPrice, value, pnl, pnlPercent, isResolved, won }
+    const resolveTime = pos.resolves_at ? new Date(pos.resolves_at) : null
+    const now = new Date()
+    
+    if (resolveTime && resolveTime > now) return 'PENDING'
+    
+    // Market has resolved
+    if (pos.current_price === 1) return 'WON'
+    if (pos.current_price === 0) return 'LOST'
+    if ((pos.pnl || 0) > 0) return 'WON'
+    if ((pos.pnl || 0) < 0) return 'LOST'
+    
+    return 'PENDING'
   }
 
-  // Helper to get trade details regardless of field names
-  const getTradeDetails = (trade: any) => {
-    const id = trade.id || trade.trade_id || trade.tradeId || ''
-    const question = trade.market_question || trade.question || trade.title || trade.market_id || trade.marketId || 'Unknown'
-    const side = trade.side || trade.outcome || '?'
-    const action = trade.action || 'buy'
-    const cost = trade.cost || trade.amount || 0
-    const shares = trade.shares || trade.shares_bought || trade.sharesBought || 0
-    const priceBefore = trade.price_before || trade.price || 0
-    const priceAfter = trade.price_after || trade.price || 0
-    const price = priceBefore || (shares > 0 ? cost / shares : 0)
-    const timestamp = trade.created_at || trade.createdAt || trade.timestamp || ''
-    const pnl = trade.pnl || trade.profit
-    const isResolved = trade.resolved ?? false
-    const won = trade.won
-    const source = trade.source || ''
-    
-    return { id, question, side, action, cost, shares, price, priceBefore, priceAfter, timestamp, pnl, isResolved, won, source }
+  // Get position side
+  const getPositionSide = (pos: Position): 'YES' | 'NO' => {
+    if ((pos.shares_yes || 0) > 0) return 'YES'
+    return 'NO'
+  }
+
+  // Get position shares
+  const getPositionShares = (pos: Position): number => {
+    return pos.shares_yes || pos.shares_no || 0
   }
 
   // Filter for fast market positions
-  const fastPositions = positions.filter(p => {
-    const q = (p.question || p.title || '').toLowerCase()
-    return q.includes('up or down') || q.includes('updown')
-  })
+  const positions = positionsData?.positions || []
+  const fastPositions = positions.filter(p => 
+    (p.question || '').toLowerCase().includes('up or down')
+  )
 
-  // Calculate totals
-  const totalValue = fastPositions.reduce((sum, p) => sum + (getPositionDetails(p).value), 0)
-  const totalPnL = fastPositions.reduce((sum, p) => sum + (getPositionDetails(p).pnl), 0)
+  // Get totals from API
+  const totalValue = positionsData?.total_value || 0
+  const totalPnL = portfolio?.pnl_total || positionsData?.polymarket_pnl || 0
+  const balance = portfolio?.balance_usdc || 0
 
-  // Filter trades for fast markets
+  // Filter trades for fast markets with actual shares
   const fastTrades = trades.filter(t => {
-    const q = (t.question || t.title || '').toLowerCase()
-    return q.includes('up or down') || q.includes('updown') || !t.question // include trades without question
+    const q = (t.market_question || '').toLowerCase()
+    return q.includes('up or down') && (t.shares || 0) > 0
   })
 
+  // Format helpers
   const formatCurrency = (value: number | undefined | null) => {
     if (value === undefined || value === null || isNaN(value)) return '$0.00'
     const sign = value < 0 ? '-' : ''
     return `${sign}$${Math.abs(value).toFixed(2)}`
   }
 
-  const formatPercent = (value: number | undefined | null) => {
-    if (value === undefined || value === null || isNaN(value)) return '0%'
+  const formatPnL = (value: number | undefined | null) => {
+    if (value === undefined || value === null || isNaN(value)) return '$0.00'
     const sign = value >= 0 ? '+' : ''
-    return `${sign}${value.toFixed(1)}%`
+    return `${sign}$${value.toFixed(2)}`
   }
 
-  const formatTime = (dateStr: string | undefined) => {
-    if (!dateStr) return ''
-    try {
-      const date = new Date(dateStr)
-      return date.toLocaleString('en-US', { 
-        month: 'short', 
-        day: 'numeric',
-        hour: 'numeric', 
-        minute: '2-digit',
-        hour12: true 
-      })
-    } catch {
-      return dateStr
+  const formatShortMarket = (question: string) => {
+    // "Bitcoin Up or Down - February 17, 1:35PM-1:40PM ET" -> "Feb 17, 1:35-1:40PM"
+    const match = question.match(/(\w+)\s+(\d+),\s*(\d+:\d+[AP]M)-(\d+:\d+[AP]M)/)
+    if (match) {
+      return `${match[1].slice(0, 3)} ${match[2]}, ${match[3]}-${match[4]}`
     }
+    return question.slice(0, 40)
   }
 
-  const formatShortTime = (dateStr: string | undefined) => {
+  const formatTradeTime = (dateStr: string | undefined) => {
     if (!dateStr) return ''
     try {
       const date = new Date(dateStr)
@@ -246,7 +203,22 @@ export default function Dashboard() {
         hour12: true 
       })
     } catch {
-      return dateStr
+      return ''
+    }
+  }
+
+  // Status badge colors
+  const getStatusBadge = (status: PositionStatus) => {
+    switch (status) {
+      case 'WON':
+        return 'bg-green-900/50 text-green-400 border-green-700'
+      case 'LOST':
+        return 'bg-red-900/50 text-red-400 border-red-700'
+      case 'REDEEMABLE':
+        return 'bg-yellow-900/50 text-yellow-400 border-yellow-700'
+      case 'PENDING':
+      default:
+        return 'bg-blue-900/50 text-blue-400 border-blue-700'
     }
   }
 
@@ -264,7 +236,7 @@ export default function Dashboard() {
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl md:text-3xl font-bold">FastLoop Dashboard</h1>
         <div className="flex items-center gap-2 text-sm text-gray-500">
-          {lastUpdated && <span>Updated: {lastUpdated.toLocaleTimeString()}</span>}
+          {lastUpdated && <span className="hidden md:inline">Updated: {lastUpdated.toLocaleTimeString()}</span>}
           <button 
             onClick={fetchData}
             className="px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded text-white transition"
@@ -282,72 +254,87 @@ export default function Dashboard() {
 
       {error && (
         <div className="mb-6 p-4 bg-red-900/50 border border-red-700 rounded-lg">
-          <p className="text-red-300">{error}</p>
+          <p className="text-red-300 text-sm">{error}</p>
         </div>
       )}
 
       {/* Stats Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6">
-          <div className="text-xs md:text-sm text-gray-500 mb-1">Wallet Balance</div>
-          <div className="text-xl md:text-2xl font-bold text-green-400">
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+          <div className="text-xs text-gray-500 mb-1">Wallet Balance</div>
+          <div className="text-xl font-bold text-green-400">
             {formatCurrency(balance)}
           </div>
         </div>
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6">
-          <div className="text-xs md:text-sm text-gray-500 mb-1">Positions Value</div>
-          <div className="text-xl md:text-2xl font-bold text-white">
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+          <div className="text-xs text-gray-500 mb-1">Positions Value</div>
+          <div className="text-xl font-bold text-white">
             {formatCurrency(totalValue)}
           </div>
         </div>
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6">
-          <div className="text-xs md:text-sm text-gray-500 mb-1">Total P&L</div>
-          <div className={`text-xl md:text-2xl font-bold ${totalPnL >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-            {formatCurrency(totalPnL)}
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+          <div className="text-xs text-gray-500 mb-1">Total P&L</div>
+          <div className={`text-xl font-bold ${totalPnL >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+            {formatPnL(totalPnL)}
           </div>
         </div>
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6">
-          <div className="text-xs md:text-sm text-gray-500 mb-1">Positions / Trades</div>
-          <div className="text-xl md:text-2xl font-bold text-white">
-            {fastPositions.length} / {fastTrades.length}
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+          <div className="text-xs text-gray-500 mb-1">Positions</div>
+          <div className="text-xl font-bold text-white">
+            {fastPositions.length}
           </div>
         </div>
       </div>
 
-      {/* Active Positions */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6 mb-6">
-        <h2 className="text-lg md:text-xl font-semibold mb-4">Active Positions</h2>
+      {/* Positions */}
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
+        <h2 className="text-lg font-semibold mb-4">Positions</h2>
         {fastPositions.length === 0 ? (
-          <p className="text-gray-500">No active positions</p>
+          <p className="text-gray-500 text-sm">No positions</p>
         ) : (
           <div className="space-y-2">
             {fastPositions.map((pos, i) => {
-              const { question, side, shares, avgPrice, currentPrice, value, pnl, pnlPercent, isResolved, won } = getPositionDetails(pos)
+              const status = getPositionStatus(pos)
+              const side = getPositionSide(pos)
+              const shares = getPositionShares(pos)
+              const pnl = pos.pnl || 0
+              const value = pos.current_value || 0
+              const cost = pos.cost_basis || 0
+              const avgPrice = pos.avg_cost || 0
+              
               return (
-                <div key={i} className={`p-3 rounded-lg border ${isResolved ? 'bg-gray-800/30 border-gray-700' : 'bg-gray-800/50 border-gray-700'}`}>
+                <div key={i} className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium truncate">{question}</div>
-                      <div className="flex items-center gap-2 mt-1">
+                      <div className="text-sm font-medium truncate">
+                        {formatShortMarket(pos.question || 'Unknown')}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 mt-1">
+                        {/* Side badge */}
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                          side.toLowerCase() === 'yes' || side.toLowerCase() === 'up' 
+                          side === 'YES' 
                             ? 'bg-green-900/50 text-green-400' 
                             : 'bg-red-900/50 text-red-400'
                         }`}>
-                          {side.toUpperCase()}
+                          {side}
                         </span>
-                        <span className="text-xs text-gray-400">{shares.toFixed(1)} shares @ {formatCurrency(avgPrice)}</span>
-                        {isResolved && (
-                          <span className={`px-2 py-0.5 rounded text-xs ${won ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'}`}>
-                            {won ? 'WON' : 'LOST'}
-                          </span>
-                        )}
+                        {/* Status badge */}
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium border ${getStatusBadge(status)}`}>
+                          {status === 'REDEEMABLE' ? 'WON - REDEEM' : status}
+                        </span>
+                        {/* Shares info */}
+                        <span className="text-xs text-gray-400">
+                          {shares.toFixed(1)} @ {(avgPrice * 100).toFixed(0)}¢
+                        </span>
                       </div>
                     </div>
                     <div className="text-right">
                       <div className="text-sm font-medium">{formatCurrency(value)}</div>
-                      <div className={`text-xs ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {formatCurrency(pnl)} ({formatPercent(pnlPercent)})
+                      <div className={`text-xs font-medium ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {formatPnL(pnl)}
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        cost: {formatCurrency(cost)}
                       </div>
                     </div>
                   </div>
@@ -359,47 +346,45 @@ export default function Dashboard() {
       </div>
 
       {/* Recent Trades */}
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6 mb-6">
-        <h2 className="text-lg md:text-xl font-semibold mb-4">Recent Trades</h2>
+      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
+        <h2 className="text-lg font-semibold mb-4">Recent Trades ({fastTrades.length})</h2>
         {fastTrades.length === 0 ? (
-          <p className="text-gray-500">No recent trades</p>
+          <p className="text-gray-500 text-sm">No trades</p>
         ) : (
           <div className="space-y-2">
-            {fastTrades
-              .filter(t => getTradeDetails(t).shares > 0) // Only show trades with actual shares
-              .slice(0, 20)
-              .map((trade, i) => {
-              const { id, question, side, action, cost, shares, price, timestamp, pnl, isResolved, won } = getTradeDetails(trade)
+            {fastTrades.slice(0, 15).map((trade, i) => {
+              const side = trade.side || '?'
+              const action = trade.action || 'buy'
+              const shares = trade.shares || 0
+              const cost = trade.cost || 0
+              const price = trade.price_before || (shares > 0 ? cost / shares : 0)
+              
               return (
-                <div key={i} className={`p-3 rounded-lg border ${isResolved ? 'bg-gray-800/30 border-gray-700' : 'bg-gray-800/50 border-gray-700'}`}>
+                <div key={i} className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm truncate">{question}</div>
+                      <div className="text-sm truncate">
+                        {formatShortMarket(trade.market_question || 'Unknown')}
+                      </div>
                       <div className="flex items-center gap-2 mt-1">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                           action === 'sell' ? 'bg-yellow-900/50 text-yellow-400' :
-                          side.toLowerCase() === 'yes' || side.toLowerCase() === 'up' 
+                          side === 'yes' 
                             ? 'bg-green-900/50 text-green-400' 
                             : 'bg-red-900/50 text-red-400'
                         }`}>
                           {action === 'sell' ? 'SELL' : side.toUpperCase()}
                         </span>
-                        <span className="text-xs text-gray-500">{formatShortTime(timestamp)}</span>
-                        {isResolved && won !== undefined && (
-                          <span className={`px-2 py-0.5 rounded text-xs ${won ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'}`}>
-                            {won ? 'WON' : 'LOST'}
-                          </span>
-                        )}
+                        <span className="text-xs text-gray-500">
+                          {formatTradeTime(trade.created_at)}
+                        </span>
                       </div>
                     </div>
                     <div className="text-right">
                       <div className="text-sm font-medium">{formatCurrency(cost)}</div>
-                      <div className="text-xs text-gray-400">{shares.toFixed(1)} shares @ {(price * 100).toFixed(0)}¢</div>
-                      {pnl !== undefined && pnl !== 0 && (
-                        <div className={`text-xs ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {formatCurrency(pnl)}
-                        </div>
-                      )}
+                      <div className="text-xs text-gray-400">
+                        {shares.toFixed(1)} @ {(price * 100).toFixed(0)}¢
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -411,22 +396,20 @@ export default function Dashboard() {
 
       {/* Debug Panel */}
       {showDebug && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 md:p-6 mb-6">
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
           <h2 className="text-lg font-semibold mb-4">Debug Info</h2>
           
-          {/* API Logs */}
           <div className="mb-4">
             <h3 className="text-sm font-medium text-gray-400 mb-2">API Calls</h3>
-            <div className="bg-black/50 rounded p-3 max-h-40 overflow-y-auto font-mono text-xs">
+            <div className="bg-black/50 rounded p-3 max-h-32 overflow-y-auto font-mono text-xs">
               {apiLogs.map((log, i) => (
-                <div key={i} className={`${log.status === 'OK' ? 'text-green-400' : 'text-red-400'}`}>
+                <div key={i} className={log.status === 'OK' ? 'text-green-400' : 'text-red-400'}>
                   [{log.timestamp}] {log.endpoint}: {log.status}
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Raw Data */}
           <div>
             <h3 className="text-sm font-medium text-gray-400 mb-2">Raw API Response</h3>
             <pre className="bg-black/50 rounded p-3 max-h-60 overflow-auto font-mono text-xs text-gray-300">
@@ -438,7 +421,7 @@ export default function Dashboard() {
 
       {/* Footer */}
       <div className="text-center text-xs text-gray-600">
-        <p>Bot running on Railway • Auto-refresh every 60s (API rate limited) • Click Debug to see API data</p>
+        <p>Auto-refresh every 60s (API rate limited)</p>
       </div>
     </main>
   )
