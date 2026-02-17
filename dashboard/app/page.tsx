@@ -133,16 +133,22 @@ export default function Dashboard() {
     
     const resolveTime = pos.resolves_at ? new Date(pos.resolves_at) : null
     const now = new Date()
+    const value = pos.current_value || 0
     
+    // If position has $0 value, it's a loss (regardless of time)
+    if (value <= 0) return 'LOST'
+    
+    // If market hasn't resolved yet and has value, it's pending
     if (resolveTime && resolveTime > now) return 'PENDING'
     
-    // Market has resolved
+    // Market has resolved - check outcome
     if (pos.current_price === 1) return 'WON'
     if (pos.current_price === 0) return 'LOST'
     if ((pos.pnl || 0) > 0) return 'WON'
     if ((pos.pnl || 0) < 0) return 'LOST'
     
-    return 'PENDING'
+    // Has value but no clear signal - likely won
+    return 'WON'
   }
 
   // Get position side
@@ -164,15 +170,35 @@ export default function Dashboard() {
 
   // Categorize positions
   const redeemablePositions = fastPositions.filter(p => p.redeemable === true)
+  
   const pendingPositions = fastPositions.filter(p => {
+    // Skip if redeemable (goes to redeemable section)
     if (p.redeemable) return false
+    
+    // If value is 0 or negative, it's a loss - not pending
+    const value = p.current_value || 0
+    if (value <= 0) return false
+    
+    // Check if market still active (resolves in future)
     const resolveTime = p.resolves_at ? new Date(p.resolves_at) : null
-    return resolveTime && resolveTime > new Date()
+    if (!resolveTime) return false
+    
+    return resolveTime > new Date()
   })
+  
   const resolvedPositions = fastPositions.filter(p => {
+    // Skip if redeemable (goes to redeemable section)
     if (p.redeemable) return false
+    
+    // Skip if it's in pending (still active with value)
+    const value = p.current_value || 0
     const resolveTime = p.resolves_at ? new Date(p.resolves_at) : null
-    return !resolveTime || resolveTime <= new Date()
+    const isStillActive = resolveTime && resolveTime > new Date() && value > 0
+    
+    if (isStillActive) return false
+    
+    // Everything else is resolved (won without redemption yet, lost, or expired)
+    return true
   })
 
   // Calculate redeemable value
