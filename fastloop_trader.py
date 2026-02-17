@@ -58,6 +58,8 @@ CONFIG_SCHEMA = {
                          "help": "Minutes of price history for momentum calc"},
     "min_time_remaining": {"default": 60, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
                            "help": "Skip fast_markets with less than this many seconds remaining"},
+    "max_time_remaining": {"default": 1800, "env": "SIMMER_SPRINT_MAX_TIME", "type": int,
+                           "help": "Skip fast_markets with more than this many seconds remaining (default 30 min)"},
     "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "Asset to trade (BTC, ETH, SOL)"},
     "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
@@ -147,6 +149,7 @@ MAX_POSITION_USD = cfg["max_position"]
 SIGNAL_SOURCE = cfg["signal_source"]
 LOOKBACK_MINUTES = cfg["lookback_minutes"]
 MIN_TIME_REMAINING = cfg["min_time_remaining"]
+MAX_TIME_REMAINING = cfg["max_time_remaining"]
 ASSET = cfg["asset"].upper()
 WINDOW = cfg["window"]  # "5m" or "15m"
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
@@ -296,7 +299,7 @@ def _parse_fast_market_end_time(question):
 
 
 def find_best_fast_market(markets):
-    """Pick the best fast_market to trade: soonest expiring with enough time remaining."""
+    """Pick the best fast_market to trade: soonest expiring within time window."""
     now = datetime.now(timezone.utc)
     candidates = []
     for m in markets:
@@ -304,7 +307,8 @@ def find_best_fast_market(markets):
         if not end_time:
             continue
         remaining = (end_time - now).total_seconds()
-        if remaining > MIN_TIME_REMAINING:
+        # Only consider markets within the time window
+        if remaining > MIN_TIME_REMAINING and remaining < MAX_TIME_REMAINING:
             candidates.append((remaining, m))
 
     if not candidates:
