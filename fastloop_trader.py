@@ -52,6 +52,8 @@ CONFIG_SCHEMA = {
                          "help": "Min BTC % move in lookback window to trigger"},
     "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
+    "max_price": {"default": 0.65, "env": "SIMMER_SPRINT_MAX_PRICE", "type": float,
+                  "help": "Max price to pay per share (don't buy above this)"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance, coingecko)"},
     "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
@@ -154,6 +156,7 @@ ASSET = cfg["asset"].upper()
 WINDOW = cfg["window"]  # "5m" or "15m"
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
 DAILY_BUDGET = cfg["daily_budget"]
+MAX_PRICE = cfg.get("max_price", 0.65)  # Don't pay more than this per share
 
 
 # =============================================================================
@@ -575,9 +578,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
     log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
     log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
+    log(f"  Max price:        ${MAX_PRICE:.2f} (won't pay more per share)")
     log(f"  Signal source:    {SIGNAL_SOURCE}")
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
-    log(f"  Min time left:    {MIN_TIME_REMAINING}s")
+    log(f"  Time window:      {MIN_TIME_REMAINING}s - {MAX_TIME_REMAINING}s before expiry")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
     daily_spend = _load_daily_spend(__file__)
     log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
@@ -736,6 +740,26 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # We have a signal!
     position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
+
+    # Max price check - don't pay more than MAX_PRICE per share
+    if price > MAX_PRICE:
+        log(f"  ⏸️  Price ${price:.2f} > max allowed ${MAX_PRICE:.2f} — skip (bad odds)")
+        if not quiet:
+            print(f"📊 Summary: No trade (price too high: ${price:.2f})")
+        return
+
+    # Check for existing position on this market (avoid doubling down or contradicting)
+    positions = get_positions(api_key)
+    market_question_lower = best["question"].lower()
+    for pos in positions:
+        pos_question = (pos.get("question", "") or "").lower()
+        if pos_question and market_question_lower in pos_question or pos_question in market_question_lower:
+            existing_shares = pos.get("shares_yes", 0) + pos.get("shares_no", 0)
+            if existing_shares > 0:
+                log(f"  ⏸️  Already have position on this market ({existing_shares:.1f} shares) — skip")
+                if not quiet:
+                    print(f"📊 Summary: No trade (already have position)")
+                return
 
     # Daily budget check
     remaining_budget = DAILY_BUDGET - daily_spend["spent"]

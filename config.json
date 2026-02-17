@@ -1,13 +1,14 @@
 {
-  "entry_threshold": 0.005,
-  "min_momentum_pct": 0.01,
+  "entry_threshold": 0.08,
+  "min_momentum_pct": 0.15,
   "max_position": 5.00,
-  "lookback_minutes": 3,
-  "min_time_remaining": 30,
-  "max_time_remaining": 900,
+  "lookback_minutes": 4,
+  "min_time_remaining": 120,
+  "max_time_remaining": 300,
+  "max_price": 0.65,
   "asset": "BTC",
   "window": "5m",
   "signal_source": "binance",
-  "volume_confidence": false,
-  "daily_budget": 100.0
+  "volume_confidence": true,
+  "daily_budget": 50.0
 }
