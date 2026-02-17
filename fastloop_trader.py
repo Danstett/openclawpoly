@@ -487,15 +487,28 @@ def discover_all_windows(asset="BTC", windows=None):
     return all_markets
 
 
-def find_best_fast_market(markets):
+def find_best_fast_market(markets, verbose=True):
     """Pick the best fast_market to trade based on VALUE strategy.
     
     For value strategy: Find markets with mispriced odds in our time window.
     Prefer 15m markets over 5m (less bot-dominated).
     Look for prices that offer good value (not too high, not too low).
+    
+    Returns: (best_market, filter_stats) where filter_stats shows why markets were filtered
     """
     now = datetime.now(timezone.utc)
     candidates = []
+    
+    # Track why markets are filtered
+    stats = {
+        "total": len(markets),
+        "filtered_time_early": 0,  # Too far from expiry
+        "filtered_time_late": 0,   # Too close to expiry
+        "filtered_price_range": 0, # Price outside buy zone
+        "filtered_low_edge": 0,    # Not enough value edge
+        "in_window": 0,            # Passed time filter
+        "candidates": 0,           # Passed all filters
+    }
     
     for m in markets:
         end_time = m.get("end_time")
@@ -503,9 +516,15 @@ def find_best_fast_market(markets):
             continue
         remaining = (end_time - now).total_seconds()
         
-        # Only consider markets within the time window (late entry)
-        if remaining < MIN_TIME_REMAINING or remaining > MAX_TIME_REMAINING:
+        # Time filter
+        if remaining > MAX_TIME_REMAINING:
+            stats["filtered_time_early"] += 1
             continue
+        if remaining < MIN_TIME_REMAINING:
+            stats["filtered_time_late"] += 1
+            continue
+        
+        stats["in_window"] += 1
         
         # Parse market prices
         try:
@@ -531,25 +550,34 @@ def find_best_fast_market(markets):
             best_price = no_price
             best_edge = no_edge
         else:
-            continue  # Neither side offers good value
+            stats["filtered_price_range"] += 1
+            if verbose:
+                print(f"    ↳ {m.get('question', '')[:40]}... YES=${yes_price:.2f} NO=${no_price:.2f} (outside {MIN_PRICE:.2f}-{MAX_PRICE:.2f})")
+            continue
         
         # Only consider if edge is above threshold
-        if best_edge >= MIN_VALUE_EDGE:
-            # Score: prefer 15m over 5m, then by edge size
-            window_bonus = 100 if m.get("window") == "15m" else 0
-            score = window_bonus + (best_edge * 100)
-            
-            m["_best_side"] = best_side
-            m["_best_price"] = best_price
-            m["_best_edge"] = best_edge
-            candidates.append((score, remaining, m))
+        if best_edge < MIN_VALUE_EDGE:
+            stats["filtered_low_edge"] += 1
+            if verbose:
+                print(f"    ↳ {m.get('question', '')[:40]}... {best_side.upper()}=${best_price:.2f} edge={best_edge:.0%} (need {MIN_VALUE_EDGE:.0%})")
+            continue
+        
+        # Score: prefer 15m over 5m, then by edge size
+        window_bonus = 100 if m.get("window") == "15m" else 0
+        score = window_bonus + (best_edge * 100)
+        
+        m["_best_side"] = best_side
+        m["_best_price"] = best_price
+        m["_best_edge"] = best_edge
+        candidates.append((score, remaining, m))
+        stats["candidates"] += 1
     
     if not candidates:
-        return None
+        return None, stats
     
     # Sort by score (highest first), then by soonest expiring
     candidates.sort(key=lambda x: (-x[0], x[1]))
-    return candidates[0][2]
+    return candidates[0][2], stats
 
 
 # =============================================================================
@@ -811,8 +839,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             print("📊 Summary: No markets available")
         return
 
-    # Step 2: Find best fast_market to trade
-    best = find_best_fast_market(markets)
+    # Step 2: Find best fast_market to trade (with value analysis)
+    log(f"\n🎯 Analyzing value opportunities...")
+    best, stats = find_best_fast_market(markets, verbose=not quiet)
+    
+    # Show filter stats
+    log(f"  Markets in time window ({MIN_TIME_REMAINING}s-{MAX_TIME_REMAINING}s): {stats['in_window']}/{stats['total']}")
+    if stats['in_window'] > 0:
+        log(f"  Filtered by price range: {stats['filtered_price_range']}")
+        log(f"  Filtered by low edge (<{MIN_VALUE_EDGE:.0%}): {stats['filtered_low_edge']}")
+        log(f"  Tradeable candidates: {stats['candidates']}")
+    
     if not best:
         # Show why no markets qualify
         now = datetime.now(timezone.utc)
