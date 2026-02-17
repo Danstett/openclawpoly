@@ -151,7 +151,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchData()
-    const interval = setInterval(fetchData, 15000) // Refresh every 15s
+    const interval = setInterval(fetchData, 60000) // Refresh every 60s (rate limit: 6/min)
     return () => clearInterval(interval)
   }, [fetchData])
 
@@ -430,7 +430,7 @@ export default function Dashboard() {
 
       {/* Footer */}
       <div className="text-center text-xs text-gray-600">
-        <p>Bot running on Railway • Auto-refresh every 15s • Click Debug to see API data</p>
+        <p>Bot running on Railway • Auto-refresh every 60s (API rate limited) • Click Debug to see API data</p>
       </div>
     </main>
   )
