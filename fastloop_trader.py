@@ -240,62 +240,86 @@ def simmer_request(path, method="GET", data=None, api_key=None):
 # Sprint Market Discovery
 # =============================================================================
 
-def discover_fast_market_markets(asset="BTC", window="5m"):
-    """Find active fast markets on Polymarket via Gamma API."""
-    patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
+def _generate_market_slugs(asset="BTC", window="5m", count=12):
+    """Generate expected market slugs for current and upcoming time windows.
     
-    # Query for crypto markets, sorted by newest created
-    url = (
-        "https://gamma-api.polymarket.com/markets"
-        "?limit=50&closed=false&tag=crypto&order=createdAt&ascending=false"
-    )
-    result = _api_request(url)
-    
-    if not result or isinstance(result, dict) and result.get("error"):
-        return []
-
-    markets = []
+    Polymarket uses slugs like: btc-updown-5m-{unix_timestamp}
+    where the timestamp is the START time of the window (rounded to 5 or 15 min).
+    """
     now = datetime.now(timezone.utc)
+    window_minutes = 5 if window == "5m" else 15
     
-    for m in result:
-        q = (m.get("question") or "").lower()
-        slug = m.get("slug", "")
-        matches_window = f"-{window}-" in slug
-        if any(p in q for p in patterns) and matches_window:
-            condition_id = m.get("conditionId", "")
-            closed = m.get("closed", False)
-            if not closed and slug:
-                # Try to get end time from API field first, fallback to parsing question
-                end_time = None
-                
-                # Check for endDate field from API
-                end_date_str = m.get("endDate") or m.get("end_date") or m.get("endDateIso")
-                if end_date_str:
-                    try:
-                        # Parse ISO format
-                        if isinstance(end_date_str, str):
-                            end_time = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-                    except:
-                        pass
-                
-                # Fallback to parsing from question
-                if not end_time:
-                    end_time = _parse_fast_market_end_time(m.get("question", ""))
-                
-                # Debug: print what we found
-                remaining = (end_time - now).total_seconds() if end_time else None
-                if remaining and remaining > 0 and remaining < 7200:  # Within 2 hours
-                    print(f"  📍 Found: {m.get('question', '')[:50]}... expires in {remaining:.0f}s")
-                
-                markets.append({
-                    "question": m.get("question", ""),
-                    "slug": slug,
-                    "condition_id": condition_id,
-                    "end_time": end_time,
-                    "outcomes": m.get("outcomes", []),
-                    "outcome_prices": m.get("outcomePrices", "[]"),
-                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-                })
+    # Round current time DOWN to nearest window boundary
+    current_minute = now.minute
+    rounded_minute = (current_minute // window_minutes) * window_minutes
+    base_time = now.replace(minute=rounded_minute, second=0, microsecond=0)
+    
+    # Generate slugs for past few windows and upcoming windows
+    asset_prefix = asset.lower()
+    slugs = []
+    
+    for i in range(-2, count):  # Start from 2 windows ago to catch active ones
+        window_start = base_time + timedelta(minutes=i * window_minutes)
+        timestamp = int(window_start.timestamp())
+        slug = f"{asset_prefix}-updown-{window}-{timestamp}"
+        slugs.append((slug, window_start + timedelta(minutes=window_minutes)))  # end_time
+    
+    return slugs
+
+
+def discover_fast_market_markets(asset="BTC", window="5m"):
+    """Find active fast markets on Polymarket via Gamma API.
+    
+    The Gamma API doesn't return today's fast markets in general queries,
+    so we generate expected slugs and query each directly.
+    """
+    now = datetime.now(timezone.utc)
+    markets = []
+    
+    # Generate slugs for current and upcoming windows
+    slug_candidates = _generate_market_slugs(asset, window, count=12)
+    
+    print(f"  Checking {len(slug_candidates)} potential market windows...")
+    
+    for slug, expected_end_time in slug_candidates:
+        # Query this specific market by slug
+        url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+        result = _api_request(url)
+        
+        if not result or isinstance(result, dict) or len(result) == 0:
+            continue
+        
+        m = result[0]  # Should be exactly one result
+        closed = m.get("closed", False)
+        
+        if closed:
+            continue
+        
+        # Get end time from API
+        end_time = None
+        end_date_str = m.get("endDate") or m.get("end_date")
+        if end_date_str:
+            try:
+                end_time = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+            except:
+                end_time = expected_end_time
+        else:
+            end_time = expected_end_time
+        
+        remaining = (end_time - now).total_seconds() if end_time else None
+        
+        if remaining and remaining > 0:
+            print(f"  📍 Found: {m.get('question', '')[:50]}... expires in {remaining:.0f}s")
+            
+            markets.append({
+                "question": m.get("question", ""),
+                "slug": slug,
+                "condition_id": m.get("conditionId", ""),
+                "end_time": end_time,
+                "outcomes": m.get("outcomes", []),
+                "outcome_prices": m.get("outcomePrices", "[]"),
+                "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+            })
     
     return markets
 
