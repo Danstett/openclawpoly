@@ -7,6 +7,6 @@
   "asset": "BTC",
   "window": "5m",
   "signal_source": "binance",
-  "volume_confidence": true,
+  "volume_confidence": false,
   "daily_budget": 50.0
 }

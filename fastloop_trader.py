@@ -796,7 +796,9 @@ if __name__ == "__main__":
         print(f"✅ Config updated: {json.dumps(updates)}")
         sys.exit(0)
 
-    dry_run = not args.live
+    # Check for live mode (CLI flag or env var)
+    live_mode = args.live or os.environ.get("LIVE", "").lower() in ("1", "true", "yes")
+    dry_run = not live_mode
     
     # Check for loop mode (CLI flag or env var)
     loop_mode = args.loop or os.environ.get("LOOP", "").lower() in ("1", "true", "yes")
