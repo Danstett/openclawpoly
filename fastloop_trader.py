@@ -577,9 +577,22 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Step 2: Find best fast_market to trade
     best = find_best_fast_market(markets)
     if not best:
-        log(f"  No fast_markets with >{MIN_TIME_REMAINING}s remaining")
+        # Show why no markets qualify
+        now = datetime.now(timezone.utc)
+        market_times = []
+        for m in markets:
+            end_time = m.get("end_time")
+            if end_time:
+                remaining = (end_time - now).total_seconds()
+                market_times.append(remaining)
+        if market_times:
+            soonest = min(market_times)
+            log(f"  No markets in trading window ({MIN_TIME_REMAINING}s - {MAX_TIME_REMAINING}s)")
+            log(f"  Soonest market expires in: {soonest:.0f}s ({soonest/60:.1f} min)")
+        else:
+            log(f"  No fast_markets with valid expiry times")
         if not quiet:
-            print("📊 Summary: No tradeable fast_markets (too close to expiry)")
+            print("📊 Summary: Waiting for market to enter trading window")
         return
 
     end_time = best.get("end_time")
