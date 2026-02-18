@@ -430,12 +430,12 @@ export default function Dashboard() {
                         </div>
                       )}
                       <div className="flex flex-wrap items-center gap-2 mt-1">
-                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                        <span className={`px-2 py-0.5 rounded text-xs font-bold ${
                           side === 'YES' 
-                            ? 'bg-green-900/50 text-green-400' 
-                            : 'bg-red-900/50 text-red-400'
+                            ? 'bg-green-900/50 text-green-400 border border-green-700' 
+                            : 'bg-red-900/50 text-red-400 border border-red-700'
                         }`}>
-                          {side}
+                          {side === 'YES' ? '📈 BTC UP' : '📉 BTC DOWN'}
                         </span>
                         <span className="px-2 py-0.5 rounded text-xs font-medium border bg-yellow-900/50 text-yellow-400 border-yellow-700">
                           WON
@@ -500,12 +500,12 @@ export default function Dashboard() {
                         </div>
                       )}
                       <div className="flex flex-wrap items-center gap-2 mt-1">
-                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                        <span className={`px-2 py-0.5 rounded text-xs font-bold ${
                           side === 'YES' 
-                            ? 'bg-green-900/50 text-green-400' 
-                            : 'bg-red-900/50 text-red-400'
+                            ? 'bg-green-900/50 text-green-400 border border-green-700' 
+                            : 'bg-red-900/50 text-red-400 border border-red-700'
                         }`}>
-                          {side}
+                          {side === 'YES' ? '📈 BTC UP' : '📉 BTC DOWN'}
                         </span>
                         <span className="px-2 py-0.5 rounded text-xs font-medium border bg-blue-900/50 text-blue-400 border-blue-700">
                           PENDING
@@ -518,6 +518,9 @@ export default function Dashboard() {
                             resolves {resolveTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' })} ET
                           </span>
                         )}
+                      </div>
+                      <div className={`text-xs mt-1 ${side === 'YES' ? 'text-green-500' : 'text-red-500'}`}>
+                        You win if BTC price is {side === 'YES' ? 'ABOVE' : 'BELOW'} the opening price at expiry
                       </div>
                     </div>
                     <div className="text-right">
@@ -576,18 +579,18 @@ export default function Dashboard() {
                         </div>
                       )}
                       <div className="flex flex-wrap items-center gap-2 mt-1">
-                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                        <span className={`px-2 py-0.5 rounded text-xs font-bold ${
                           side === 'YES' 
-                            ? 'bg-green-900/50 text-green-400' 
-                            : 'bg-red-900/50 text-red-400'
+                            ? 'bg-green-900/50 text-green-400 border border-green-700' 
+                            : 'bg-red-900/50 text-red-400 border border-red-700'
                         }`}>
-                          {side}
+                          {side === 'YES' ? '📈 UP' : '📉 DOWN'}
                         </span>
                         <span className={`px-2 py-0.5 rounded text-xs font-medium border ${getStatusBadge(status)}`}>
                           {status}
                         </span>
                         <span className="text-xs text-gray-500">
-                          {shares.toFixed(1)} shares
+                          {shares.toFixed(1)} @ {((pos.avg_cost || 0) * 100).toFixed(0)}¢
                         </span>
                       </div>
                     </div>
