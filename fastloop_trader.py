@@ -28,7 +28,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType, BookParams
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
@@ -52,8 +52,8 @@ except ImportError:
 # =============================================================================
 
 CONFIG_SCHEMA = {
-    "strategy": {"default": "value", "env": "FASTLOOP_STRATEGY", "type": str,
-                 "help": "Strategy type: 'value' (contrarian) or 'momentum'"},
+    "strategy": {"default": "arbitrage", "env": "FASTLOOP_STRATEGY", "type": str,
+                 "help": "Strategy type: 'arbitrage' (dual-side), 'momentum', or 'value'"},
     "windows": {"default": ["15m", "5m"], "env": None, "type": list,
                 "help": "Market windows to scan (15m preferred, 5m backup)"},
     "min_value_edge": {"default": 0.12, "env": "FASTLOOP_VALUE_EDGE", "type": float,
@@ -78,6 +78,19 @@ CONFIG_SCHEMA = {
                           "help": "Require volume confirmation"},
     "daily_budget": {"default": 50.0, "env": "FASTLOOP_DAILY_BUDGET", "type": float,
                      "help": "Max total spend per UTC day"},
+    # Arbitrage strategy settings
+    "entry_threshold": {"default": 0.45, "env": "FASTLOOP_ENTRY_THRESHOLD", "type": float,
+                        "help": "Max ask price to trigger buy on either side (arb strategy)"},
+    "max_combined_cost": {"default": 0.97, "env": "FASTLOOP_MAX_COMBINED", "type": float,
+                          "help": "Max combined avg cost per matched YES+NO pair (arb strategy)"},
+    "arb_trade_size": {"default": 2.0, "env": "FASTLOOP_ARB_TRADE_SIZE", "type": float,
+                       "help": "USD per individual arb trade (smaller, more frequent)"},
+    "max_unhedged_ratio": {"default": 0.6, "env": "FASTLOOP_MAX_UNHEDGED", "type": float,
+                           "help": "Max ratio of unmatched shares to total shares"},
+    "max_trades_per_window": {"default": 20, "env": "FASTLOOP_MAX_TRADES_WINDOW", "type": int,
+                              "help": "Max trades per market window (arb strategy)"},
+    "arb_min_time_remaining": {"default": 120, "env": "FASTLOOP_ARB_MIN_TIME", "type": int,
+                               "help": "Min seconds before expiry for arb entry"},
 }
 
 TRADE_SOURCE = "sdk:fastloop"
@@ -179,6 +192,14 @@ ASSET = _raw_cfg.get("asset", cfg.get("asset", "BTC")).upper()
 VOLUME_CONFIDENCE = _raw_cfg.get("volume_confidence", cfg.get("volume_confidence", False))
 DAILY_BUDGET = _raw_cfg.get("daily_budget", cfg.get("daily_budget", 50.0))
 
+# Arbitrage strategy constants
+ENTRY_THRESHOLD = _raw_cfg.get("entry_threshold", cfg.get("entry_threshold", 0.45))
+MAX_COMBINED_COST = _raw_cfg.get("max_combined_cost", cfg.get("max_combined_cost", 0.97))
+ARB_TRADE_SIZE = _raw_cfg.get("arb_trade_size", cfg.get("arb_trade_size", 2.0))
+MAX_UNHEDGED_RATIO = _raw_cfg.get("max_unhedged_ratio", cfg.get("max_unhedged_ratio", 0.6))
+MAX_TRADES_PER_WINDOW = _raw_cfg.get("max_trades_per_window", cfg.get("max_trades_per_window", 20))
+ARB_MIN_TIME_REMAINING = _raw_cfg.get("arb_min_time_remaining", cfg.get("arb_min_time_remaining", 120))
+
 
 # =============================================================================
 # Daily Budget Tracking
@@ -209,6 +230,89 @@ def _save_daily_spend(skill_file, spend_data):
     spend_path = _get_spend_path(skill_file)
     with open(spend_path, "w") as f:
         json.dump(spend_data, f, indent=2)
+
+
+# =============================================================================
+# Window Position Tracking (Arbitrage Strategy)
+# =============================================================================
+
+def _get_window_positions_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "window_positions.json"
+
+
+def load_window_positions(skill_file):
+    """Load window position tracking state. Prune expired windows."""
+    pos_path = _get_window_positions_path(skill_file)
+    positions = {}
+    if pos_path.exists():
+        try:
+            with open(pos_path) as f:
+                positions = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            positions = {}
+
+    # Prune windows that expired > 30 min ago
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=30)
+    pruned = {}
+    for slug, data in positions.items():
+        try:
+            end_str = data.get("market_end_time", "")
+            if end_str:
+                end_time = datetime.fromisoformat(end_str)
+                if end_time > cutoff:
+                    pruned[slug] = data
+        except (KeyError, ValueError):
+            pass  # Drop entries with bad data
+    return pruned
+
+
+def save_window_positions(skill_file, positions):
+    """Save window position state to disk."""
+    pos_path = _get_window_positions_path(skill_file)
+    with open(pos_path, "w") as f:
+        json.dump(positions, f, indent=2)
+
+
+def update_window_position(window_positions, slug, side, shares, price, market):
+    """Update accumulated position after a successful trade."""
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    if slug not in window_positions:
+        clob_ids = market.get("clob_token_ids", ["", ""])
+        end_time = market.get("end_time")
+        end_time_str = end_time.isoformat() if isinstance(end_time, datetime) else str(end_time or "")
+        window_positions[slug] = {
+            "yes_token_id": clob_ids[0] if len(clob_ids) > 0 else "",
+            "no_token_id": clob_ids[1] if len(clob_ids) > 1 else "",
+            "yes_shares": 0, "yes_avg_price": 0, "yes_total_cost": 0,
+            "no_shares": 0, "no_avg_price": 0, "no_total_cost": 0,
+            "trade_count": 0,
+            "market_end_time": end_time_str,
+            "market_question": market.get("question", ""),
+            "condition_id": market.get("condition_id", ""),
+            "created_at": now_str,
+            "last_trade_at": now_str,
+        }
+
+    pos = window_positions[slug]
+    cost = shares * price
+
+    if side == "yes":
+        old_total = pos["yes_shares"] * pos["yes_avg_price"]
+        pos["yes_shares"] += shares
+        pos["yes_avg_price"] = (old_total + cost) / pos["yes_shares"] if pos["yes_shares"] > 0 else price
+        pos["yes_total_cost"] += cost
+    else:
+        old_total = pos["no_shares"] * pos["no_avg_price"]
+        pos["no_shares"] += shares
+        pos["no_avg_price"] = (old_total + cost) / pos["no_shares"] if pos["no_shares"] > 0 else price
+        pos["no_total_cost"] += cost
+
+    pos["trade_count"] += 1
+    pos["last_trade_at"] = now_str
+    return pos
 
 
 # =============================================================================
@@ -367,7 +471,14 @@ def sell_position(condition_id, side, shares, clob_token_ids=None):
 
     try:
         # Get current best bid price for this token
-        book = client.get_order_book(token_id)
+        try:
+            book = client.get_order_book(token_id)
+        except Exception as ob_err:
+            err_str = str(ob_err)
+            if "404" in err_str or "No orderbook" in err_str.lower():
+                return {"error": "Market resolved (no orderbook)", "expired": True}
+            raise
+
         best_bid = 0.99  # default for winning positions
         if book and hasattr(book, 'bids') and book.bids and len(book.bids) > 0:
             best_bid = float(book.bids[0].price)
@@ -425,6 +536,9 @@ def auto_sell_positions(redeemable):
             price = result.get("price", 0)
             print(f"    ✅ Sold {result['shares_sold']:.1f} shares @ ${price:.2f}")
             sold.append(p)
+        elif result and result.get("expired"):
+            print(f"    ℹ️  Market resolved/expired — skipping (no orderbook)")
+            sold.append(p)  # Mark as processed so we don't retry
         else:
             error = result.get("error", "Unknown error")
             print(f"    ⚠️  Sell failed: {error}")
@@ -891,6 +1005,242 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
 
 
 # =============================================================================
+# Arbitrage Strategy — Orderbook Analysis & Decision Logic
+# =============================================================================
+
+def get_orderbook_prices(client, clob_token_ids):
+    """Fetch best ask/bid for both YES and NO tokens in a single batch call.
+
+    Returns dict with yes/no best ask, bid, and depth, or None on error.
+    """
+    if not clob_token_ids or len(clob_token_ids) < 2:
+        return None
+
+    yes_token_id = clob_token_ids[0]
+    no_token_id = clob_token_ids[1]
+
+    try:
+        books = client.get_order_books([
+            BookParams(token_id=yes_token_id),
+            BookParams(token_id=no_token_id),
+        ])
+
+        if not books or len(books) < 2:
+            return None
+
+        yes_book, no_book = books[0], books[1]
+        result = {"yes_token_id": yes_token_id, "no_token_id": no_token_id}
+
+        # YES side
+        if yes_book.asks and len(yes_book.asks) > 0:
+            result["yes_best_ask"] = float(yes_book.asks[0].price)
+            result["yes_ask_size"] = float(yes_book.asks[0].size)
+        else:
+            result["yes_best_ask"] = None
+            result["yes_ask_size"] = 0
+
+        if yes_book.bids and len(yes_book.bids) > 0:
+            result["yes_best_bid"] = float(yes_book.bids[0].price)
+        else:
+            result["yes_best_bid"] = None
+
+        # NO side
+        if no_book.asks and len(no_book.asks) > 0:
+            result["no_best_ask"] = float(no_book.asks[0].price)
+            result["no_ask_size"] = float(no_book.asks[0].size)
+        else:
+            result["no_best_ask"] = None
+            result["no_ask_size"] = 0
+
+        if no_book.bids and len(no_book.bids) > 0:
+            result["no_best_bid"] = float(no_book.bids[0].price)
+        else:
+            result["no_best_bid"] = None
+
+        return result
+
+    except Exception:
+        return None
+
+
+def calculate_combined_cost(window_pos):
+    """Calculate combined cost per matched pair and profit metrics.
+
+    A 'matched pair' = min(yes_shares, no_shares). These are guaranteed to
+    resolve to $1.00 regardless of outcome.
+    """
+    yes_shares = window_pos.get("yes_shares", 0)
+    no_shares = window_pos.get("no_shares", 0)
+    yes_avg = window_pos.get("yes_avg_price", 0)
+    no_avg = window_pos.get("no_avg_price", 0)
+
+    matched_pairs = min(yes_shares, no_shares)
+    unmatched_yes = yes_shares - matched_pairs
+    unmatched_no = no_shares - matched_pairs
+    total_shares = yes_shares + no_shares
+
+    if matched_pairs > 0:
+        combined_cost_per_pair = yes_avg + no_avg
+        guaranteed_profit_per_pair = 1.0 - combined_cost_per_pair
+    else:
+        combined_cost_per_pair = 0
+        guaranteed_profit_per_pair = 0
+
+    unhedged_ratio = (unmatched_yes + unmatched_no) / total_shares if total_shares > 0 else 0
+
+    return {
+        "matched_pairs": matched_pairs,
+        "unmatched_yes": unmatched_yes,
+        "unmatched_no": unmatched_no,
+        "combined_cost_per_pair": combined_cost_per_pair,
+        "guaranteed_profit_per_pair": guaranteed_profit_per_pair,
+        "total_guaranteed_profit": guaranteed_profit_per_pair * matched_pairs,
+        "total_invested": window_pos.get("yes_total_cost", 0) + window_pos.get("no_total_cost", 0),
+        "unhedged_ratio": unhedged_ratio,
+    }
+
+
+def should_buy_side(side, ask_price, window_pos, momentum=None):
+    """Decide whether to buy the given side at the given ask price.
+
+    Four gates: price threshold, trade count, combined cost projection,
+    and unhedged ratio. Returns (should_buy, reason, priority_score).
+    """
+    # Gate 1: Price must be below entry threshold
+    if ask_price > ENTRY_THRESHOLD:
+        return False, f"ask ${ask_price:.2f} > threshold ${ENTRY_THRESHOLD:.2f}", 0
+
+    # Gate 2: Trade count limit per window
+    trade_count = window_pos.get("trade_count", 0)
+    if trade_count >= MAX_TRADES_PER_WINDOW:
+        return False, f"hit max trades ({MAX_TRADES_PER_WINDOW})", 0
+
+    # Gate 3: Combined cost projection
+    yes_shares = window_pos.get("yes_shares", 0)
+    no_shares = window_pos.get("no_shares", 0)
+    yes_avg = window_pos.get("yes_avg_price", 0)
+    no_avg = window_pos.get("no_avg_price", 0)
+
+    new_shares = ARB_TRADE_SIZE / ask_price if ask_price > 0 else 0
+
+    if side == "yes":
+        new_yes_shares = yes_shares + new_shares
+        new_yes_avg = ((yes_avg * yes_shares) + (ask_price * new_shares)) / new_yes_shares if new_yes_shares > 0 else ask_price
+        projected_combined = new_yes_avg + no_avg
+        proj_unmatched = abs(new_yes_shares - no_shares)
+        proj_total = new_yes_shares + no_shares
+    else:
+        new_no_shares = no_shares + new_shares
+        new_no_avg = ((no_avg * no_shares) + (ask_price * new_shares)) / new_no_shares if new_no_shares > 0 else ask_price
+        projected_combined = yes_avg + new_no_avg
+        proj_unmatched = abs(yes_shares - new_no_shares)
+        proj_total = yes_shares + new_no_shares
+
+    # Only enforce combined cost when both sides have shares
+    other_has_shares = (no_shares > 0 if side == "yes" else yes_shares > 0)
+    if other_has_shares and projected_combined > MAX_COMBINED_COST:
+        return False, f"combined ${projected_combined:.3f} > max ${MAX_COMBINED_COST:.2f}", 0
+
+    # Gate 4: Unhedged ratio limit
+    if proj_total > 0:
+        proj_unhedged_ratio = proj_unmatched / proj_total
+        if proj_unhedged_ratio > MAX_UNHEDGED_RATIO:
+            return False, f"unhedged {proj_unhedged_ratio:.0%} > max {MAX_UNHEDGED_RATIO:.0%}", 0
+
+    # Priority scoring (higher = more attractive)
+    price_score = (ENTRY_THRESHOLD - ask_price) / ENTRY_THRESHOLD * 100
+
+    # Bonus for balancing (buying the underweight side)
+    balance_score = 0
+    if side == "yes" and no_shares > yes_shares:
+        balance_score = 20
+    elif side == "no" and yes_shares > no_shares:
+        balance_score = 20
+
+    # Momentum tiebreaker (small influence)
+    momentum_score = 0
+    if momentum and momentum.get("direction") != "neutral":
+        mom_pct = abs(momentum.get("momentum_pct", 0))
+        if side == "yes" and momentum["direction"] == "up":
+            momentum_score = min(10, mom_pct * 200)
+        elif side == "no" and momentum["direction"] == "down":
+            momentum_score = min(10, mom_pct * 200)
+
+    priority = price_score + balance_score + momentum_score
+    return True, "ok", priority
+
+
+def find_arbitrage_opportunities(markets, client, window_positions, momentum=None, verbose=True):
+    """Scan all active markets for dual-side buy opportunities.
+
+    Returns ranked list of opportunities sorted by priority (highest first).
+    """
+    now = datetime.now(timezone.utc)
+    opportunities = []
+
+    for m in markets:
+        end_time = m.get("end_time")
+        if not end_time:
+            continue
+        remaining = (end_time - now).total_seconds()
+
+        if remaining < ARB_MIN_TIME_REMAINING:
+            continue
+
+        clob_token_ids = m.get("clob_token_ids", [])
+        if not clob_token_ids or len(clob_token_ids) < 2:
+            continue
+
+        ob = get_orderbook_prices(client, clob_token_ids)
+        if not ob:
+            if verbose:
+                print(f"    skip {m.get('slug', '')}: could not fetch orderbook")
+            continue
+
+        slug = m.get("slug", "")
+        window_pos = window_positions.get(slug, {})
+
+        # Log orderbook state
+        yes_ask = ob.get("yes_best_ask")
+        no_ask = ob.get("no_best_ask")
+        if verbose:
+            yes_str = f"${yes_ask:.3f}" if yes_ask else "n/a"
+            no_str = f"${no_ask:.3f}" if no_ask else "n/a"
+            print(f"    {slug}: YES ask={yes_str} NO ask={no_str} ({remaining:.0f}s left)")
+
+        # Evaluate YES side
+        if yes_ask is not None:
+            can_buy, reason, priority = should_buy_side("yes", yes_ask, window_pos, momentum)
+            if can_buy:
+                opportunities.append({
+                    "market": m, "side": "yes", "price": yes_ask,
+                    "available_size": ob.get("yes_ask_size", 0),
+                    "priority": priority, "reason": reason,
+                    "window_pos": window_pos, "ob_data": ob,
+                    "remaining_seconds": remaining,
+                })
+            elif verbose and yes_ask <= ENTRY_THRESHOLD:
+                print(f"      YES skip: {reason}")
+
+        # Evaluate NO side
+        if no_ask is not None:
+            can_buy, reason, priority = should_buy_side("no", no_ask, window_pos, momentum)
+            if can_buy:
+                opportunities.append({
+                    "market": m, "side": "no", "price": no_ask,
+                    "available_size": ob.get("no_ask_size", 0),
+                    "priority": priority, "reason": reason,
+                    "window_pos": window_pos, "ob_data": ob,
+                    "remaining_seconds": remaining,
+                })
+            elif verbose and no_ask <= ENTRY_THRESHOLD:
+                print(f"      NO skip: {reason}")
+
+    opportunities.sort(key=lambda x: -x["priority"])
+    return opportunities
+
+
+# =============================================================================
 # Import & Trade
 # =============================================================================
 
@@ -1058,7 +1408,233 @@ def calculate_position_size(max_size, smart_sizing=False):
 
 
 # =============================================================================
-# Main Strategy Logic
+# Arbitrage Strategy — Main Entry Point
+# =============================================================================
+
+def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False,
+                           smart_sizing=False, quiet=False):
+    """Run one cycle of the dual-side arbitrage (probability compression) strategy.
+
+    Instead of predicting BTC direction, buy both YES and NO at different times
+    when each becomes cheap. Keep combined cost under $1.00 for guaranteed profit.
+    """
+    def log(msg, force=False):
+        if not quiet or force:
+            print(msg)
+
+    log("⚡ Polymarket FastLoop Trading Bot (ARBITRAGE STRATEGY)")
+    log("=" * 50)
+
+    if dry_run:
+        log("\n  [DRY RUN] No trades will be executed. Use --live to enable trading.")
+
+    log(f"\n⚙️  Configuration:")
+    log(f"  Strategy:           ARBITRAGE (dual-side probability compression)")
+    log(f"  Asset:              {ASSET}")
+    log(f"  Windows:            {', '.join(WINDOWS)}")
+    log(f"  Entry threshold:    ${ENTRY_THRESHOLD:.2f} (buy when ask drops below)")
+    log(f"  Max combined cost:  ${MAX_COMBINED_COST:.2f} (per matched YES+NO pair)")
+    log(f"  Trade size:         ${ARB_TRADE_SIZE:.2f} per trade")
+    log(f"  Max unhedged ratio: {MAX_UNHEDGED_RATIO:.0%}")
+    log(f"  Max trades/window:  {MAX_TRADES_PER_WINDOW}")
+    log(f"  Min time remaining: {ARB_MIN_TIME_REMAINING}s")
+    daily_spend = _load_daily_spend(__file__)
+    log(f"  Daily budget:       ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent, {daily_spend['trades']} trades)")
+
+    if show_config:
+        config_path = _get_config_path(__file__)
+        log(f"\n  Config file: {config_path}")
+        log(f"\n  To change settings:")
+        log(f'    python fastloop_trader.py --set entry_threshold=0.40')
+        log(f'    python fastloop_trader.py --set arb_trade_size=3.0')
+        return
+
+    # Initialize CLOB client
+    client = get_clob_client()
+
+    # Check for winning positions and sell them
+    if not dry_run:
+        check_and_sell_winners()
+
+    # Show positions if requested
+    if positions_only:
+        log("\n📊 Arbitrage Window Positions:")
+        window_positions = load_window_positions(__file__)
+        if not window_positions:
+            log("  No active window positions")
+        else:
+            for slug, wp in window_positions.items():
+                metrics = calculate_combined_cost(wp)
+                log(f"\n  {slug}:")
+                log(f"    YES: {wp['yes_shares']:.1f} shares @ avg ${wp['yes_avg_price']:.3f} (${wp['yes_total_cost']:.2f})")
+                log(f"    NO:  {wp['no_shares']:.1f} shares @ avg ${wp['no_avg_price']:.3f} (${wp['no_total_cost']:.2f})")
+                log(f"    Matched pairs: {metrics['matched_pairs']:.1f} | Combined: ${metrics['combined_cost_per_pair']:.3f}")
+                log(f"    Guaranteed profit: ${metrics['total_guaranteed_profit']:.2f} | Trades: {wp['trade_count']}")
+
+        # Also show Data API positions
+        log("\n📊 All Sprint Positions:")
+        positions = get_positions()
+        fast_positions = [p for p in positions if "up or down" in (p.get("question", "") or "").lower()]
+        if not fast_positions:
+            log("  No open fast market positions")
+        else:
+            for pos in fast_positions:
+                log(f"  • {pos.get('question', 'Unknown')[:60]}")
+                log(f"    YES: {pos.get('shares_yes', 0):.1f} | NO: {pos.get('shares_no', 0):.1f} | P&L: ${pos.get('pnl', 0):.2f}")
+        return
+
+    # Load window positions state
+    window_positions = load_window_positions(__file__)
+
+    # Show current accumulated positions
+    if window_positions:
+        log(f"\n📦 Active window positions: {len(window_positions)}")
+        for slug, wp in window_positions.items():
+            metrics = calculate_combined_cost(wp)
+            log(f"  {slug}: YES={wp['yes_shares']:.0f}@${wp['yes_avg_price']:.2f} "
+                f"NO={wp['no_shares']:.0f}@${wp['no_avg_price']:.2f} "
+                f"pairs={metrics['matched_pairs']:.0f} profit=${metrics['total_guaranteed_profit']:.2f}")
+
+    # Step 1: Fetch momentum (optional tiebreaker)
+    log(f"\n📈 Fetching {ASSET} momentum (tiebreaker only)...")
+    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
+    if momentum:
+        log(f"  {ASSET}: ${momentum['price_now']:,.2f} ({momentum['momentum_pct']:+.3f}% {momentum['direction']})")
+    else:
+        log(f"  Could not fetch momentum (continuing without tiebreaker)")
+
+    # Step 2: Discover active markets
+    log(f"\n🔍 Discovering {ASSET} fast markets ({', '.join(WINDOWS)})...")
+    markets = discover_all_windows(ASSET, WINDOWS)
+    log(f"\n  Found {len(markets)} active markets")
+
+    if not markets:
+        log("  No active fast markets found")
+        if not quiet:
+            print("📊 Summary: No markets available")
+        save_window_positions(__file__, window_positions)
+        return
+
+    # Step 3: Scan orderbooks for entry opportunities
+    log(f"\n🎯 Scanning orderbooks for arbitrage opportunities...")
+    opportunities = find_arbitrage_opportunities(
+        markets, client, window_positions, momentum, verbose=not quiet
+    )
+
+    log(f"\n  Found {len(opportunities)} buyable opportunities")
+
+    if not opportunities:
+        if not quiet:
+            print("📊 Summary: No arb opportunities (prices above threshold or limits hit)")
+        save_window_positions(__file__, window_positions)
+        return
+
+    # Step 4: Execute the best opportunity (one trade per cycle)
+    best = opportunities[0]
+    m = best["market"]
+    side = best["side"]
+    price = best["price"]
+    slug = m.get("slug", "")
+
+    log(f"\n🎯 Best opportunity:", force=True)
+    log(f"  Market:    {m['question'][:60]}", force=True)
+    log(f"  Side:      {side.upper()} @ ${price:.3f}", force=True)
+    log(f"  Priority:  {best['priority']:.1f}", force=True)
+    log(f"  Remaining: {best['remaining_seconds']:.0f}s", force=True)
+
+    # Show accumulated position context
+    wp = best["window_pos"]
+    if wp and (wp.get("yes_shares", 0) > 0 or wp.get("no_shares", 0) > 0):
+        metrics = calculate_combined_cost(wp)
+        log(f"  Accumulated: YES={wp.get('yes_shares', 0):.0f} NO={wp.get('no_shares', 0):.0f} "
+            f"pairs={metrics['matched_pairs']:.0f} combined=${metrics['combined_cost_per_pair']:.3f}", force=True)
+
+    # Daily budget check
+    remaining_budget = DAILY_BUDGET - daily_spend["spent"]
+    trade_amount = min(ARB_TRADE_SIZE, remaining_budget)
+    if trade_amount < 0.50:
+        log(f"  Budget exhausted (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f})", force=True)
+        save_window_positions(__file__, window_positions)
+        return
+
+    # Minimum order size check
+    desired_shares = trade_amount / price if price > 0 else 0
+    if desired_shares < MIN_SHARES_PER_ORDER:
+        log(f"  Trade too small: {desired_shares:.1f} shares < min {MIN_SHARES_PER_ORDER}")
+        save_window_positions(__file__, window_positions)
+        return
+
+    clob_token_ids = m.get("clob_token_ids", [])
+    if not clob_token_ids or len(clob_token_ids) < 2:
+        log(f"  No CLOB token IDs for this market", force=True)
+        save_window_positions(__file__, window_positions)
+        return
+
+    if dry_run:
+        log(f"  [DRY RUN] Would buy {side.upper()} ${trade_amount:.2f} (~{desired_shares:.1f} shares)", force=True)
+        # Still track in window_positions for dry-run visibility
+        update_window_position(window_positions, slug, side, desired_shares, price, m)
+    else:
+        log(f"  Executing {side.upper()} trade for ${trade_amount:.2f}...", force=True)
+        result = execute_trade(clob_token_ids, side, trade_amount, price)
+
+        if result and result.get("success"):
+            shares = result.get("shares_bought", 0)
+            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+
+            # Update window position tracking
+            update_window_position(window_positions, slug, side, shares, price, m)
+
+            # Update daily spend
+            daily_spend["spent"] += trade_amount
+            daily_spend["trades"] += 1
+            _save_daily_spend(__file__, daily_spend)
+
+            # Calculate updated metrics
+            updated_metrics = calculate_combined_cost(window_positions[slug])
+
+            # Slack notification with arb context
+            suffix = (f"• Arb: pairs={updated_metrics['matched_pairs']:.0f}, "
+                      f"combined=${updated_metrics['combined_cost_per_pair']:.3f}, "
+                      f"profit=${updated_metrics['total_guaranteed_profit']:.2f}")
+            notify_trade(side, shares, price, m["question"],
+                         updated_metrics["total_guaranteed_profit"], suffix=suffix)
+
+            # Trade journal
+            if JOURNAL_AVAILABLE:
+                log_trade(
+                    trade_id=result.get("order_id", ""),
+                    source=TRADE_SOURCE,
+                    thesis=f"ARB: {side.upper()} @ ${price:.3f}, combined=${updated_metrics['combined_cost_per_pair']:.3f}",
+                    confidence=0.85,
+                    asset=ASSET,
+                    momentum_pct=round(momentum["momentum_pct"], 3) if momentum else 0,
+                    volume_ratio=round(momentum["volume_ratio"], 2) if momentum else 1,
+                    signal_source="arbitrage",
+                )
+        else:
+            error = result.get("error", "Unknown") if result else "No response"
+            is_no_liquidity = "liquidity" in error.lower() or "not filled" in error.lower()
+            if is_no_liquidity:
+                log(f"  ⏸️  No liquidity at ${price:.2f}", force=True)
+            else:
+                log(f"  ❌ Trade failed: {error}", force=True)
+                send_slack_notification(f"❌ *Arb Trade Failed*\n• Market: {m['question'][:40]}...\n• Error: {error}", "❌")
+
+    # Save updated window positions
+    save_window_positions(__file__, window_positions)
+
+    # Summary
+    if not quiet:
+        print(f"\n📊 Summary:")
+        print(f"  Strategy: ARBITRAGE | {side.upper()} @ ${price:.3f} | Window: {slug}")
+        if window_positions.get(slug):
+            metrics = calculate_combined_cost(window_positions[slug])
+            print(f"  Pairs: {metrics['matched_pairs']:.0f} | Combined: ${metrics['combined_cost_per_pair']:.3f} | Profit: ${metrics['total_guaranteed_profit']:.2f}")
+
+
+# =============================================================================
+# Main Strategy Logic (Momentum — legacy)
 # =============================================================================
 
 def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
@@ -1378,6 +1954,24 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
 
 # =============================================================================
+# Strategy Dispatcher
+# =============================================================================
+
+def run_strategy(dry_run=True, positions_only=False, show_config=False,
+                 smart_sizing=False, quiet=False):
+    """Dispatch to the configured strategy."""
+    if STRATEGY == "arbitrage":
+        run_arbitrage_strategy(dry_run=dry_run, positions_only=positions_only,
+                               show_config=show_config, smart_sizing=smart_sizing,
+                               quiet=quiet)
+    else:
+        # "momentum" or "value" — both use the existing function
+        run_fast_market_strategy(dry_run=dry_run, positions_only=positions_only,
+                                  show_config=show_config, smart_sizing=smart_sizing,
+                                  quiet=quiet)
+
+
+# =============================================================================
 # CLI Entry Point
 # =============================================================================
 
@@ -1432,7 +2026,7 @@ if __name__ == "__main__":
     interval = int(os.environ.get("LOOP_INTERVAL", args.interval))
     
     if loop_mode:
-        print(f"🔄 Running in loop mode (interval: {interval}s)")
+        print(f"🔄 Running in loop mode (interval: {interval}s, strategy: {STRATEGY})")
 
         # Initialize CLOB client and show wallet info
         client = get_clob_client()
@@ -1447,7 +2041,7 @@ if __name__ == "__main__":
             run_count += 1
             print(f"\n--- Run #{run_count} @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
             try:
-                run_fast_market_strategy(
+                run_strategy(
                     dry_run=dry_run,
                     positions_only=args.positions,
                     show_config=args.config,
@@ -1459,7 +2053,7 @@ if __name__ == "__main__":
             print(f"\n⏳ Sleeping {interval}s...")
             time.sleep(interval)
     else:
-        run_fast_market_strategy(
+        run_strategy(
             dry_run=dry_run,
             positions_only=args.positions,
             show_config=args.config,

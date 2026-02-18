@@ -1,6 +1,9 @@
 {
-  "strategy": "momentum",
-  "windows": ["15m", "5m"],
+  "strategy": "arbitrage",
+  "windows": [
+    "15m",
+    "5m"
+  ],
   "min_value_edge": 0.08,
   "max_price": 0.55,
   "min_price": 0.3,
@@ -11,5 +14,11 @@
   "asset": "BTC",
   "signal_source": "binance",
   "volume_confidence": false,
-  "daily_budget": 999999.0
+  "daily_budget": 999999.0,
+  "entry_threshold": 0.45,
+  "max_combined_cost": 0.97,
+  "arb_trade_size": 2.0,
+  "max_unhedged_ratio": 0.6,
+  "max_trades_per_window": 20,
+  "arb_min_time_remaining": 120
 }

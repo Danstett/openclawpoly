@@ -5,3 +5,4 @@ __pycache__/
 .env.local
 daily_spend.json
 notified_redeemable.json
+window_positions.json
