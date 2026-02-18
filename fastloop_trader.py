@@ -231,12 +231,23 @@ def get_clob_client():
         print("Set it to your Polygon wallet private key (hex string)")
         sys.exit(1)
 
-    _clob_client = ClobClient(
-        "https://clob.polymarket.com",
-        key=private_key,
-        chain_id=137,
-        signature_type=0,  # EOA wallet
-    )
+    # Polymarket proxy wallet address (holds the funds)
+    funder = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
+
+    # Detect signature type: if funder is set and differs from the signer,
+    # use signature_type=1 (proxy/Magic wallet)
+    sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "1"))
+
+    kwargs = {
+        "host": "https://clob.polymarket.com",
+        "key": private_key,
+        "chain_id": 137,
+        "signature_type": sig_type,
+    }
+    if funder:
+        kwargs["funder"] = funder
+
+    _clob_client = ClobClient(**kwargs)
     # Derive API credentials for authenticated endpoints
     _clob_client.set_api_creds(_clob_client.create_or_derive_api_creds())
     return _clob_client
@@ -884,20 +895,43 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
 # =============================================================================
 
 def get_portfolio():
-    """Get portfolio summary: USDC balance."""
+    """Get portfolio summary: USDC balance.
+
+    Tries CLOB API first, falls back to on-chain RPC query.
+    """
+    # Try CLOB API balance first
     try:
         client = get_clob_client()
         bal = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        # USDC has 6 decimals on Polygon
         balance_raw = float(bal.get("balance", 0)) if isinstance(bal, dict) else 0
-        # py-clob-client may return already-converted values; handle both
-        balance = balance_raw / 1e6 if balance_raw > 1e6 else balance_raw
-        return {"balance_usdc": balance}
+        # CLOB returns balance in raw USDC units (6 decimals)
+        balance = balance_raw / 1e6
+        if balance > 0:
+            return {"balance_usdc": balance}
+    except Exception:
+        pass
+
+    # Fallback: query USDC.e balance on-chain via RPC
+    try:
+        address = get_wallet_address()
+        usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        data = "0x70a08231" + address[2:].lower().zfill(64)
+        payload = json.dumps({
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{"to": usdc_contract, "data": data}, "latest"], "id": 1
+        }).encode()
+        rpc_url = os.environ.get("POLYGON_RPC_URL", "https://1rpc.io/matic")
+        req = Request(rpc_url, data=payload, headers={"Content-Type": "application/json"})
+        resp = json.loads(urlopen(req, timeout=10).read())
+        if "result" in resp:
+            balance = int(resp["result"], 16) / 1e6
+            return {"balance_usdc": balance}
     except Exception as e:
         print(f"  ⚠️  Could not fetch balance: {e}")
-        return {"balance_usdc": 0, "error": str(e)}
+
+    return {"balance_usdc": 0}
 
 
 def get_positions():
