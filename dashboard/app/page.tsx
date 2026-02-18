@@ -274,25 +274,36 @@ export default function Dashboard() {
 
   // Generate Polymarket URL for a position
   const getPolymarketUrl = (pos: Position): string | null => {
-    // If we have a slug, use it directly
-    if (pos.slug) {
+    // If we have a slug that looks like a real Polymarket slug (not a UUID), use it
+    if (pos.slug && !pos.slug.match(/^[0-9a-f]{8}-[0-9a-f]{4}-/)) {
       return `https://polymarket.com/event/${pos.slug}`
     }
-    // If we have market_id that looks like a slug (contains letters), use it
-    if (pos.market_id && /[a-z]/.test(pos.market_id)) {
-      return `https://polymarket.com/event/${pos.market_id}`
-    }
-    // Try to construct slug from question for BTC fast markets
-    // "Bitcoin Up or Down - February 17, 1:35PM-1:40PM ET"
+    // Construct slug from question for BTC fast markets
+    // Polymarket slug format: btc-updown-{window}-{START_timestamp}
+    // where START_timestamp = resolve_timestamp - window_duration
     const question = pos.question || ''
-    if (question.toLowerCase().includes('bitcoin up or down')) {
-      // Extract the time window to determine 5m vs 15m
-      const timeMatch = question.match(/(\d+):(\d+)[AP]M-(\d+):(\d+)[AP]M/)
-      if (timeMatch && pos.resolves_at) {
+    if (question.toLowerCase().includes('bitcoin up or down') || question.toLowerCase().includes('btc')) {
+      if (pos.resolves_at) {
         const resolveTs = Math.floor(new Date(pos.resolves_at).getTime() / 1000)
-        const window = question.includes('15') ? '15m' : '5m'
-        return `https://polymarket.com/event/btc-updown-${window}-${resolveTs}`
+        // Determine window size from question (look for time range like 1:35PM-1:50PM = 15m)
+        const timeMatch = question.match(/(\d+):(\d+)(AM|PM)\s*-\s*(\d+):(\d+)(AM|PM)/)
+        let windowMinutes = 5
+        if (timeMatch) {
+          const startH = parseInt(timeMatch[1])
+          const startM = parseInt(timeMatch[2])
+          const endH = parseInt(timeMatch[4])
+          const endM = parseInt(timeMatch[5])
+          const diff = (endH * 60 + endM) - (startH * 60 + startM)
+          if (diff === 15 || diff === -45) windowMinutes = 15
+        }
+        const windowTag = windowMinutes === 15 ? '15m' : '5m'
+        const startTs = resolveTs - (windowMinutes * 60)
+        return `https://polymarket.com/event/btc-updown-${windowTag}-${startTs}`
       }
+    }
+    // Fallback: link to condition on Polymarket if we have condition_id
+    if (pos.condition_id) {
+      return `https://polymarket.com/event?id=${pos.condition_id}`
     }
     return null
   }
