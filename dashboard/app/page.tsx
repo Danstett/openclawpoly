@@ -7,6 +7,8 @@ interface Position {
   condition_id?: string
   slug?: string
   question?: string
+  side?: string
+  shares?: number
   shares_yes?: number
   shares_no?: number
   current_price?: number
@@ -151,14 +153,33 @@ export default function Dashboard() {
     return 'WON'
   }
 
-  // Get position side
+  // Get position side - use explicit side field first, then compare share counts
   const getPositionSide = (pos: Position): 'YES' | 'NO' => {
-    if ((pos.shares_yes || 0) > 0) return 'YES'
-    return 'NO'
+    // 1. Use explicit side field from API if available
+    if (pos.side) {
+      return pos.side.toLowerCase() === 'yes' ? 'YES' : 'NO'
+    }
+    // 2. Use redeemable_side for resolved positions
+    if (pos.redeemable_side) {
+      return pos.redeemable_side.toLowerCase() === 'yes' ? 'YES' : 'NO'
+    }
+    // 3. Compare shares_yes vs shares_no (pick whichever is larger)
+    const yes = pos.shares_yes || 0
+    const no = pos.shares_no || 0
+    if (yes > 0 && no > 0) {
+      return yes >= no ? 'YES' : 'NO'
+    }
+    if (yes > 0) return 'YES'
+    if (no > 0) return 'NO'
+    return 'YES'
   }
 
-  // Get position shares
+  // Get position shares - use explicit shares field or the correct side's count
   const getPositionShares = (pos: Position): number => {
+    if (pos.shares && pos.shares > 0) return pos.shares
+    const side = getPositionSide(pos)
+    if (side === 'YES' && (pos.shares_yes || 0) > 0) return pos.shares_yes!
+    if (side === 'NO' && (pos.shares_no || 0) > 0) return pos.shares_no!
     return pos.shares_yes || pos.shares_no || 0
   }
 

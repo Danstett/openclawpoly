@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import math
+import time
 import argparse
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
@@ -246,12 +247,12 @@ def _api_request(url, method="GET", data=None, headers=None, timeout=15):
         return {"error": str(e)}
 
 
-def simmer_request(path, method="GET", data=None, api_key=None):
+def simmer_request(path, method="GET", data=None, api_key=None, timeout=15):
     """Make a Simmer API request."""
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    return _api_request(f"{SIMMER_BASE}{path}", method=method, data=data, headers=headers)
+    return _api_request(f"{SIMMER_BASE}{path}", method=method, data=data, headers=headers, timeout=timeout)
 
 
 # =============================================================================
@@ -285,7 +286,7 @@ def send_slack_notification(message, emoji="🤖"):
         print(f"  ⚠️ Slack notification failed: {e}")
 
 
-def notify_trade(side, shares, price, market_question, pnl_potential=None):
+def notify_trade(side, shares, price, market_question, pnl_potential=None, suffix=""):
     """Send Slack notification for a new trade."""
     short_market = market_question[:50] if len(market_question) > 50 else market_question
     cost = shares * price
@@ -296,6 +297,8 @@ def notify_trade(side, shares, price, market_question, pnl_potential=None):
     msg += f"• Cost: ${cost:.2f}"
     if pnl_potential:
         msg += f"\n• Potential profit: ${pnl_potential:.2f}"
+    if suffix:
+        msg += f"\n{suffix}"
     send_slack_notification(msg, "📈")
 
 
@@ -487,27 +490,65 @@ def discover_all_windows(asset="BTC", windows=None):
     return all_markets
 
 
-def find_best_fast_market(markets, verbose=True):
-    """Pick the best fast_market to trade based on VALUE strategy.
+def calculate_momentum_fair_value(momentum):
+    """Calculate fair value for YES/NO based on CEX momentum.
     
-    For value strategy: Find markets with mispriced odds in our time window.
-    Prefer 15m markets over 5m (less bot-dominated).
-    Look for prices that offer good value (not too high, not too low).
+    Instead of flat 50¢, shift fair value based on how much BTC has moved.
+    A clear directional move means the momentum side is worth more than 50¢.
+    
+    Returns: (yes_fair, no_fair, momentum_strength)
+    """
+    if not momentum or momentum.get("direction") == "neutral":
+        return 0.50, 0.50, 0.0
+    
+    momentum_pct = abs(momentum["momentum_pct"])
+    direction = momentum["direction"]
+    
+    # Scale fair value shift based on momentum magnitude
+    # 0.05% → small shift (52-53%), 0.2% → moderate (57-60%), 0.5%+ → strong (65%+)
+    # Capped at 25% shift from 50¢ to avoid extreme estimates
+    fair_value_shift = min(0.25, momentum_pct * 0.50)
+    
+    if direction == "up":
+        yes_fair = 0.50 + fair_value_shift
+        no_fair = 0.50 - fair_value_shift
+    else:
+        yes_fair = 0.50 - fair_value_shift
+        no_fair = 0.50 + fair_value_shift
+    
+    return yes_fair, no_fair, momentum_pct
+
+
+# Minimum CEX momentum to consider a trade (skip noise)
+MIN_MOMENTUM_PCT = 0.04
+
+
+def find_best_fast_market(markets, momentum=None, verbose=True):
+    """Pick the best fast_market to trade using momentum-informed fair value.
+    
+    Strategy: Use CEX price momentum to estimate which side will win,
+    then find markets where that side is still underpriced.
+    Trade WITH momentum (if BTC is going up, buy YES while it's still cheap).
     
     Returns: (best_market, filter_stats) where filter_stats shows why markets were filtered
     """
     now = datetime.now(timezone.utc)
     candidates = []
     
+    # Calculate momentum-based fair values
+    yes_fair, no_fair, momentum_strength = calculate_momentum_fair_value(momentum)
+    momentum_direction = momentum.get("direction", "neutral") if momentum else "neutral"
+    
     # Track why markets are filtered
     stats = {
         "total": len(markets),
-        "filtered_time_early": 0,  # Too far from expiry
-        "filtered_time_late": 0,   # Too close to expiry
-        "filtered_price_range": 0, # Price outside buy zone
-        "filtered_low_edge": 0,    # Not enough value edge
-        "in_window": 0,            # Passed time filter
-        "candidates": 0,           # Passed all filters
+        "filtered_time_early": 0,
+        "filtered_time_late": 0,
+        "filtered_price_range": 0,
+        "filtered_low_edge": 0,
+        "filtered_no_momentum": 0,
+        "in_window": 0,
+        "candidates": 0,
     }
     
     for m in markets:
@@ -530,53 +571,84 @@ def find_best_fast_market(markets, verbose=True):
         try:
             prices = json.loads(m.get("outcome_prices", "[]"))
             yes_price = float(prices[0]) if prices else 0.5
-            no_price = 1 - yes_price
-        except:
+            no_price = float(prices[1]) if len(prices) > 1 else (1 - yes_price)
+        except Exception:
             yes_price = 0.5
             no_price = 0.5
         
-        # Calculate value edge for both sides
-        # Fair value is 50¢ - any deviation is potential edge
-        yes_edge = 0.5 - yes_price  # Positive if YES is cheap
-        no_edge = 0.5 - no_price    # Positive if NO is cheap
+        # Momentum-informed edge calculation
+        # Edge = how much the market underprices the momentum side
+        yes_edge = yes_fair - yes_price
+        no_edge = no_fair - no_price
         
-        # Find the better value side
-        if yes_edge > no_edge and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
-            best_side = "yes"
-            best_price = yes_price
-            best_edge = yes_edge
-        elif no_price >= MIN_PRICE and no_price <= MAX_PRICE:
-            best_side = "no"
-            best_price = no_price
-            best_edge = no_edge
+        # Pick the side that momentum favors AND has positive edge
+        if momentum_direction == "up":
+            # Momentum says UP → prefer YES
+            if yes_edge > 0 and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
+                best_side = "yes"
+                best_price = yes_price
+                best_edge = yes_edge
+            elif no_edge > 0 and no_price >= MIN_PRICE and no_price <= MAX_PRICE:
+                # NO still has edge somehow (unusual, maybe momentum just started)
+                best_side = "no"
+                best_price = no_price
+                best_edge = no_edge
+            else:
+                stats["filtered_price_range"] += 1
+                continue
+        elif momentum_direction == "down":
+            # Momentum says DOWN → prefer NO
+            if no_edge > 0 and no_price >= MIN_PRICE and no_price <= MAX_PRICE:
+                best_side = "no"
+                best_price = no_price
+                best_edge = no_edge
+            elif yes_edge > 0 and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
+                best_side = "yes"
+                best_price = yes_price
+                best_edge = yes_edge
+            else:
+                stats["filtered_price_range"] += 1
+                continue
         else:
-            stats["filtered_price_range"] += 1
-            if verbose:
-                print(f"    ↳ {m.get('question', '')[:40]}... YES=${yes_price:.2f} NO=${no_price:.2f} (outside {MIN_PRICE:.2f}-{MAX_PRICE:.2f})")
-            continue
+            # No clear momentum → find best value side (old approach as fallback)
+            if yes_edge > no_edge and yes_edge > 0 and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
+                best_side = "yes"
+                best_price = yes_price
+                best_edge = yes_edge
+            elif no_edge > 0 and no_price >= MIN_PRICE and no_price <= MAX_PRICE:
+                best_side = "no"
+                best_price = no_price
+                best_edge = no_edge
+            else:
+                stats["filtered_price_range"] += 1
+                continue
         
         # Only consider if edge is above threshold
         if best_edge < MIN_VALUE_EDGE:
             stats["filtered_low_edge"] += 1
             if verbose:
-                print(f"    ↳ {m.get('question', '')[:40]}... {best_side.upper()}=${best_price:.2f} edge={best_edge:.0%} (need {MIN_VALUE_EDGE:.0%})")
+                fair = yes_fair if best_side == "yes" else no_fair
+                print(f"    ↳ {m.get('question', '')[:40]}... {best_side.upper()}=${best_price:.2f} fair=${fair:.2f} edge={best_edge:.0%} (need {MIN_VALUE_EDGE:.0%})")
             continue
         
-        # Score: prefer 15m over 5m, then by edge size
+        # Score: prefer 15m over 5m, then by edge size, then by time remaining (earlier = better)
         window_bonus = 100 if m.get("window") == "15m" else 0
-        score = window_bonus + (best_edge * 100)
+        time_bonus = remaining / MAX_TIME_REMAINING * 20  # Prefer earlier entry
+        score = window_bonus + (best_edge * 100) + time_bonus
         
         m["_best_side"] = best_side
         m["_best_price"] = best_price
         m["_best_edge"] = best_edge
+        m["_yes_fair"] = yes_fair
+        m["_no_fair"] = no_fair
         candidates.append((score, remaining, m))
         stats["candidates"] += 1
     
     if not candidates:
         return None, stats
     
-    # Sort by score (highest first), then by soonest expiring
-    candidates.sort(key=lambda x: (-x[0], x[1]))
+    # Sort by score (highest first), then by most time remaining (earlier entry)
+    candidates.sort(key=lambda x: (-x[0], -x[1]))
     return candidates[0][2], stats
 
 
@@ -738,14 +810,14 @@ def get_positions(api_key):
 
 
 def execute_trade(api_key, market_id, side, amount):
-    """Execute a trade on Simmer."""
+    """Execute a trade on Simmer. Uses longer timeout since on-chain settlement is slow."""
     return simmer_request("/api/sdk/trade", method="POST", data={
         "market_id": market_id,
         "side": side,
         "amount": amount,
         "venue": "polymarket",
         "source": TRADE_SOURCE,
-    }, api_key=api_key)
+    }, api_key=api_key, timeout=90)
 
 
 def calculate_position_size(api_key, max_size, smart_sizing=False):
@@ -775,20 +847,20 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if not quiet or force:
             print(msg)
 
-    log("⚡ Simmer FastLoop Trading Skill (VALUE STRATEGY)")
+    log("⚡ Simmer FastLoop Trading Skill (MOMENTUM STRATEGY)")
     log("=" * 50)
 
     if dry_run:
         log("\n  [DRY RUN] No trades will be executed. Use --live to enable trading.")
 
     log(f"\n⚙️  Configuration:")
-    log(f"  Strategy:         {STRATEGY.upper()} (buy underpriced, contrarian)")
+    log(f"  Strategy:         MOMENTUM (CEX-informed directional)")
     log(f"  Asset:            {ASSET}")
     log(f"  Windows:          {', '.join(WINDOWS)} (15m preferred)")
-    log(f"  Value edge:       {MIN_VALUE_EDGE:.0%} min (how cheap must it be)")
+    log(f"  Min edge:         {MIN_VALUE_EDGE:.0%} (momentum-adjusted fair value)")
     log(f"  Price range:      ${MIN_PRICE:.2f} - ${MAX_PRICE:.2f} (buy zone)")
     log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
-    log(f"  Entry window:     {MIN_TIME_REMAINING}s - {MAX_TIME_REMAINING}s before expiry (late entry)")
+    log(f"  Entry window:     {MIN_TIME_REMAINING}s - {MAX_TIME_REMAINING}s before expiry")
     log(f"  Signal source:    {SIGNAL_SOURCE}")
     daily_spend = _load_daily_spend(__file__)
     log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
@@ -828,7 +900,33 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if portfolio and not portfolio.get("error"):
             log(f"  Balance: ${portfolio.get('balance_usdc', 0):.2f}")
 
-    # Step 1: Discover fast markets across all windows
+    # Step 1: Get CEX momentum FIRST — this drives our directional signal
+    log(f"\n📈 Fetching {ASSET} momentum ({SIGNAL_SOURCE}, {LOOKBACK_MINUTES}m lookback)...")
+    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
+
+    if momentum:
+        log(f"  Price: ${momentum['price_now']:,.2f}")
+        log(f"  Recent move: {momentum['momentum_pct']:+.3f}%")
+        log(f"  Direction: {momentum['direction'].upper()}")
+        log(f"  Volume ratio: {momentum['volume_ratio']:.1f}x avg")
+
+        momentum_pct = abs(momentum["momentum_pct"])
+        if momentum_pct < MIN_MOMENTUM_PCT:
+            log(f"  ⏸️  Momentum {momentum_pct:.3f}% < {MIN_MOMENTUM_PCT}% threshold — market is flat, skip")
+            if not quiet:
+                print(f"📊 Summary: No trade (insufficient momentum: {momentum_pct:.3f}%)")
+            return
+        
+        # Show fair value estimate
+        yes_fair, no_fair, _ = calculate_momentum_fair_value(momentum)
+        log(f"  Fair values: YES=${yes_fair:.2f} NO=${no_fair:.2f} (momentum-adjusted)")
+    else:
+        log("  ⚠️ Could not fetch CEX price — cannot determine direction, skip")
+        if not quiet:
+            print("📊 Summary: No trade (CEX data unavailable)")
+        return
+
+    # Step 2: Discover fast markets across all windows
     log(f"\n🔍 Discovering {ASSET} fast markets ({', '.join(WINDOWS)})...")
     markets = discover_all_windows(ASSET, WINDOWS)
     log(f"\n  Found {len(markets)} total active markets")
@@ -839,9 +937,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             print("📊 Summary: No markets available")
         return
 
-    # Step 2: Find best fast_market to trade (with value analysis)
-    log(f"\n🎯 Analyzing value opportunities...")
-    best, stats = find_best_fast_market(markets, verbose=not quiet)
+    # Step 3: Find best market to trade (using momentum-informed fair value)
+    log(f"\n🎯 Finding momentum opportunities...")
+    best, stats = find_best_fast_market(markets, momentum=momentum, verbose=not quiet)
     
     # Show filter stats
     log(f"  Markets in time window ({MIN_TIME_REMAINING}s-{MAX_TIME_REMAINING}s): {stats['in_window']}/{stats['total']}")
@@ -877,60 +975,49 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Window:     {window_type}")
     log(f"  Expires in: {remaining:.0f}s ({remaining/60:.1f} min)")
 
-    # Get pre-calculated value analysis from find_best_fast_market
+    # Get pre-calculated analysis from find_best_fast_market
     side = best.get("_best_side", "yes")
     price = best.get("_best_price", 0.5)
     value_edge = best.get("_best_edge", 0)
+    yes_fair = best.get("_yes_fair", 0.5)
+    no_fair = best.get("_no_fair", 0.5)
     
     # Parse market odds for display
     try:
         prices = json.loads(best.get("outcome_prices", "[]"))
         market_yes_price = float(prices[0]) if prices else 0.5
+        market_no_price = float(prices[1]) if len(prices) > 1 else (1 - market_yes_price)
     except (json.JSONDecodeError, IndexError, ValueError):
         market_yes_price = 0.5
+        market_no_price = 0.5
     
-    log(f"  YES price:  ${market_yes_price:.3f}")
-    log(f"  NO price:   ${1-market_yes_price:.3f}")
+    log(f"  YES price:  ${market_yes_price:.3f} (fair: ${yes_fair:.3f})")
+    log(f"  NO price:   ${market_no_price:.3f} (fair: ${no_fair:.3f})")
     log(f"  Best side:  {side.upper()} @ ${price:.3f}")
-    log(f"  Value edge: {value_edge:.1%} (fair=50¢)")
+    log(f"  Edge:       {value_edge:.1%} (momentum-adjusted)")
 
     # Fee info (fast markets charge 10% on winnings)
     fee_rate_bps = best.get("fee_rate_bps", 0)
-    fee_rate = fee_rate_bps / 10000  # 1000 bps -> 0.10
+    fee_rate = fee_rate_bps / 10000
     if fee_rate > 0:
         log(f"  Fee rate:   {fee_rate:.0%} (Polymarket fast market fee)")
 
-    # Step 3: Get CEX price for sanity check (optional)
-    log(f"\n📈 Fetching {ASSET} price ({SIGNAL_SOURCE}) for sanity check...")
-    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
-
-    if momentum:
-        log(f"  Price: ${momentum['price_now']:,.2f}")
-        log(f"  Recent move: {momentum['momentum_pct']:+.3f}%")
-        
-        # VALUE STRATEGY: We're betting AGAINST extreme momentum
-        # If BTC moved a lot and we're buying the cheap side, that's good value
-        direction = momentum["direction"]
-        momentum_pct = abs(momentum["momentum_pct"])
-        
-        # Contrarian check: warn if betting with strong momentum (not contrarian)
-        if momentum_pct > 0.3:
-            if (direction == "up" and side == "yes") or (direction == "down" and side == "no"):
-                log(f"  ⚠️  Warning: betting WITH momentum (not contrarian)")
-            else:
-                log(f"  ✓ Contrarian bet: {side.upper()} against {direction} momentum")
-    else:
-        log("  ⚠️ Could not fetch CEX price (proceeding with value signal)")
-
-    # Step 4: Decision logic for VALUE strategy
-    log(f"\n🧠 VALUE Strategy Analysis...")
+    # Step 4: Decision checks
+    log(f"\n🧠 Momentum Strategy Analysis...")
+    log(f"  {ASSET} momentum: {momentum['momentum_pct']:+.3f}% → favors {'YES' if momentum['direction'] == 'up' else 'NO'}")
+    log(f"  Buying {side.upper()} @ ${price:.2f} (fair=${yes_fair if side == 'yes' else no_fair:.2f})")
     
-    # The value edge was already validated in find_best_fast_market
-    # But let's double-check and explain the trade
+    # Alignment check
+    momentum_side = "yes" if momentum["direction"] == "up" else "no"
+    if side == momentum_side:
+        log(f"  ✓ Aligned with momentum — buying the direction CEX is moving")
+    else:
+        log(f"  ⚠️  Counter-momentum trade (momentum favors {momentum_side.upper()}, buying {side.upper()})")
+    
     if value_edge < MIN_VALUE_EDGE:
-        log(f"  ⏸️  Value edge {value_edge:.1%} < minimum {MIN_VALUE_EDGE:.1%} — skip")
+        log(f"  ⏸️  Edge {value_edge:.1%} < minimum {MIN_VALUE_EDGE:.1%} — skip")
         if not quiet:
-            print(f"📊 Summary: No trade (insufficient value edge)")
+            print(f"📊 Summary: No trade (insufficient edge)")
         return
     
     # Fee-aware EV check
@@ -939,15 +1026,15 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         breakeven = price / (win_profit + price)
         log(f"  Breakeven: {breakeven:.1%} win rate needed (fee-adjusted)")
         
-        # For value strategy, we need edge to overcome fees
-        required_edge = breakeven - 0.50 + 0.02  # 2% buffer
-        if value_edge < required_edge:
-            log(f"  ⏸️  Value edge {value_edge:.1%} < fee-adjusted minimum {required_edge:.1%} — skip")
+        fair_value = yes_fair if side == "yes" else no_fair
+        implied_win_rate = fair_value
+        if implied_win_rate < breakeven + 0.02:
+            log(f"  ⏸️  Implied win rate {implied_win_rate:.1%} < breakeven {breakeven:.1%} + 2% buffer — skip")
             if not quiet:
                 print(f"📊 Summary: No trade (fees eat the edge)")
             return
     
-    trade_rationale = f"VALUE: {side.upper()} at ${price:.2f} has {value_edge:.0%} edge from fair (50¢)"
+    trade_rationale = f"MOMENTUM: {side.upper()} at ${price:.2f}, {ASSET} {momentum['momentum_pct']:+.3f}%, edge {value_edge:.0%}"
 
     # We have a value signal!
     position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
@@ -1013,12 +1100,67 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
     else:
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
+
+        # Snapshot positions BEFORE the trade so we can verify after timeout
+        pre_trade_positions = get_positions(api_key)
+        pre_trade_shares = 0
+        market_question_lower = best["question"].lower()
+        for pos in pre_trade_positions:
+            pos_q = (pos.get("question", "") or "").lower()
+            if pos_q and (market_question_lower in pos_q or pos_q in market_question_lower):
+                pre_trade_shares = (pos.get("shares_yes", 0) or 0) + (pos.get("shares_no", 0) or 0)
+                break
+
         result = execute_trade(api_key, market_id, side, position_size)
+        trade_succeeded = False
+        verified_via_position = False
 
         if result and result.get("success"):
+            trade_succeeded = True
             shares = result.get("shares_bought") or result.get("shares") or 0
             trade_id = result.get("trade_id")
-            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+        else:
+            error = result.get("error", "Unknown error") if result else "No response"
+            is_timeout = "timed out" in error.lower()
+            is_no_liquidity = "not filled" in error.lower() or "no liquidity" in error.lower()
+
+            if is_timeout:
+                # Trade may have gone through despite timeout — verify by checking positions
+                log(f"  ⏳ Trade timed out — verifying position...", force=True)
+                time.sleep(5)
+                post_trade_positions = get_positions(api_key)
+                post_trade_shares = 0
+                for pos in post_trade_positions:
+                    pos_q = (pos.get("question", "") or "").lower()
+                    if pos_q and (market_question_lower in pos_q or pos_q in market_question_lower):
+                        post_trade_shares = (pos.get("shares_yes", 0) or 0) + (pos.get("shares_no", 0) or 0)
+                        break
+
+                new_shares = post_trade_shares - pre_trade_shares
+                if new_shares > 0:
+                    trade_succeeded = True
+                    verified_via_position = True
+                    shares = new_shares
+                    trade_id = None
+                    log(f"  ✅ Trade verified! {new_shares:.1f} new shares detected despite timeout", force=True)
+                else:
+                    log(f"  ❌ Trade timed out and no new position detected — trade likely failed", force=True)
+                    send_slack_notification(
+                        f"⏳ *Trade Timed Out (Not Filled)*\n• Market: {best['question'][:40]}...\n• No new position detected after verification",
+                        "⏳"
+                    )
+
+            elif is_no_liquidity:
+                log(f"  ⏸️  No liquidity at ${price:.2f} — order book empty at this price", force=True)
+                # Don't send Slack for no-liquidity — it's expected in thin markets
+
+            else:
+                log(f"  ❌ Trade failed: {error}", force=True)
+                send_slack_notification(f"❌ *Trade Failed*\n• Market: {best['question'][:40]}...\n• Error: {error}", "❌")
+
+        if trade_succeeded:
+            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}" +
+                (" (verified after timeout)" if verified_via_position else ""), force=True)
 
             # Update daily spend
             daily_spend["spent"] += position_size
@@ -1026,8 +1168,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             _save_daily_spend(__file__, daily_spend)
 
             # Send Slack notification
-            potential_profit = shares * (1 - price) * 0.9  # 10% fee on winnings
-            notify_trade(side, shares, price, best["question"], potential_profit)
+            potential_profit = shares * (1 - price) * 0.9
+            suffix = " _(verified after timeout)_" if verified_via_position else ""
+            notify_trade(side, shares, price, best["question"], potential_profit, suffix=suffix)
 
             # Log to trade journal
             if trade_id and JOURNAL_AVAILABLE:
@@ -1042,19 +1185,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                     volume_ratio=round(momentum["volume_ratio"], 2) if momentum else 1,
                     signal_source=SIGNAL_SOURCE,
                 )
-        else:
-            error = result.get("error", "Unknown error") if result else "No response"
-            log(f"  ❌ Trade failed: {error}", force=True)
-            # Notify on trade failure too
-            send_slack_notification(f"❌ *Trade Failed*\n• Market: {best['question'][:40]}...\n• Error: {error}", "❌")
 
     # Summary
-    total_trades = 0 if dry_run else (1 if result and result.get("success") else 0)
+    total_trades = 0 if dry_run else (1 if trade_succeeded else 0)
     show_summary = not quiet or total_trades > 0
     if show_summary:
         print(f"\n📊 Summary:")
         print(f"  Market: {best['question'][:50]}")
-        print(f"  Strategy: VALUE | {side.upper()} @ ${price:.2f} | Edge: {value_edge:.0%}")
+        print(f"  Strategy: MOMENTUM | {side.upper()} @ ${price:.2f} | Edge: {value_edge:.0%}")
         print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
 
 
@@ -1113,7 +1251,6 @@ if __name__ == "__main__":
     interval = int(os.environ.get("LOOP_INTERVAL", args.interval))
     
     if loop_mode:
-        import time
         print(f"🔄 Running in loop mode (interval: {interval}s)")
         print("=" * 50)
         run_count = 0
