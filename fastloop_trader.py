@@ -302,37 +302,82 @@ def notify_trade(side, shares, price, market_question, pnl_potential=None, suffi
     send_slack_notification(msg, "📈")
 
 
-def notify_redeemable(positions):
-    """Send Slack notification for redeemable positions."""
-    if not positions:
+def redeem_position(api_key, market_id, side):
+    """Redeem a winning position for USDC. Uses longer timeout for on-chain settlement."""
+    return simmer_request("/api/sdk/redeem", method="POST", data={
+        "market_id": market_id,
+        "side": side,
+    }, api_key=api_key, timeout=90)
+
+
+def auto_redeem_positions(api_key, redeemable):
+    """Attempt to redeem all redeemable positions. Returns (redeemed, failed) lists."""
+    redeemed = []
+    failed = []
+    
+    for p in redeemable:
+        market_id = p.get("market_id")
+        if not market_id:
+            continue
+        
+        side = (p.get("redeemable_side") or p.get("side") or "yes").lower()
+        question = (p.get("question") or "Unknown")[:40]
+        value = p.get("current_value", 0)
+        
+        print(f"  💰 Redeeming {question}... (${value:.2f}, {side.upper()})")
+        result = redeem_position(api_key, market_id, side)
+        
+        if result and result.get("success"):
+            tx_hash = result.get("tx_hash", "")
+            print(f"    ✅ Redeemed! tx: {tx_hash[:16]}..." if tx_hash else "    ✅ Redeemed!")
+            redeemed.append(p)
+        else:
+            error = result.get("error", "Unknown error") if result else "No response"
+            print(f"    ⚠️  Redeem failed: {error}")
+            failed.append((p, error))
+    
+    return redeemed, failed
+
+
+def notify_redeemed(redeemed, failed):
+    """Send Slack notification for auto-redeemed positions."""
+    if not redeemed and not failed:
         return
     
-    total_value = sum(p.get("current_value", 0) for p in positions)
-    msg = f"🎉 *Positions Ready to Redeem!*\n"
-    msg += f"• Count: {len(positions)} position(s)\n"
-    msg += f"• Total value: *${total_value:.2f}*\n\n"
+    total_value = sum(p.get("current_value", 0) for p in redeemed)
     
-    for p in positions[:5]:  # Max 5 positions in message
-        question = p.get("question", "Unknown")[:40]
-        value = p.get("current_value", 0)
-        msg += f"  • {question}... (${value:.2f})\n"
+    if redeemed:
+        msg = f"💰 *Auto-Redeemed {len(redeemed)} Position(s)!*\n"
+        msg += f"• Total: *${total_value:.2f}* returned to wallet\n\n"
+        
+        for p in redeemed[:5]:
+            question = p.get("question", "Unknown")[:40]
+            value = p.get("current_value", 0)
+            msg += f"  ✅ {question}... (${value:.2f})\n"
+        
+        if len(redeemed) > 5:
+            msg += f"  ... and {len(redeemed) - 5} more\n"
+        
+        send_slack_notification(msg, "💰")
     
-    if len(positions) > 5:
-        msg += f"  ... and {len(positions) - 5} more\n"
-    
-    msg += "\n_Redeem at: simmer.markets/dashboard_"
-    send_slack_notification(msg, "🎉")
+    if failed:
+        msg = f"⚠️ *{len(failed)} Redemption(s) Failed*\n"
+        for p, error in failed[:3]:
+            question = p.get("question", "Unknown")[:40]
+            msg += f"  • {question}...: {error[:50]}\n"
+        msg += "\n_Try manually at: simmer.markets/dashboard_"
+        send_slack_notification(msg, "⚠️")
 
 
 def check_and_notify_redeemable(api_key):
-    """Check for redeemable positions and notify once per position."""
+    """Check for redeemable positions, auto-redeem them, and notify via Slack."""
     positions = get_positions(api_key)
     redeemable = [p for p in positions if p.get("redeemable") == True]
     
     if not redeemable:
         return
     
-    # Track which positions we've already notified about
+    # Track which positions we've already processed
     notified_path = _get_spend_path(__file__).parent / "notified_redeemable.json"
     notified_ids = set()
     
@@ -343,18 +388,25 @@ def check_and_notify_redeemable(api_key):
         except (json.JSONDecodeError, IOError):
             pass
     
-    # Find new redeemable positions
+    # Find new redeemable positions we haven't processed yet
     new_redeemable = []
     for p in redeemable:
-        # Use question as ID since market_id might not be available
         pos_id = p.get("market_id") or p.get("question", "")[:50]
         if pos_id and pos_id not in notified_ids:
             new_redeemable.append(p)
             notified_ids.add(pos_id)
     
     if new_redeemable:
-        notify_redeemable(new_redeemable)
-        # Save updated notified IDs
+        total_value = sum(p.get("current_value", 0) for p in new_redeemable)
+        print(f"\n💰 Found {len(new_redeemable)} redeemable position(s) worth ${total_value:.2f}")
+        
+        # Auto-redeem all positions
+        redeemed, failed = auto_redeem_positions(api_key, new_redeemable)
+        
+        # Notify via Slack
+        notify_redeemed(redeemed, failed)
+        
+        # Save updated processed IDs
         with open(notified_path, "w") as f:
             json.dump(list(notified_ids), f)
 
