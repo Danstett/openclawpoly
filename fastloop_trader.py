@@ -292,6 +292,7 @@ def update_window_position(window_positions, slug, side, shares, price, market):
             "market_end_time": end_time_str,
             "market_question": market.get("question", ""),
             "condition_id": market.get("condition_id", ""),
+            "pending_orders": [],
             "created_at": now_str,
             "last_trade_at": now_str,
         }
@@ -1142,7 +1143,9 @@ def should_buy_side(side, ask_price, window_pos, momentum=None):
         return False, f"combined ${projected_combined:.3f} > max ${MAX_COMBINED_COST:.2f}", 0
 
     # Gate 4: Unhedged ratio limit
-    if proj_total > 0:
+    # Skip this gate when no existing position — must allow initial trades on either side
+    total_existing = yes_shares + no_shares
+    if total_existing > 0 and proj_total > 0:
         proj_unhedged_ratio = proj_unmatched / proj_total
         if proj_unhedged_ratio > MAX_UNHEDGED_RATIO:
             return False, f"unhedged {proj_unhedged_ratio:.0%} > max {MAX_UNHEDGED_RATIO:.0%}", 0
@@ -1173,6 +1176,9 @@ def should_buy_side(side, ask_price, window_pos, momentum=None):
 def find_arbitrage_opportunities(markets, client, window_positions, momentum=None, verbose=True):
     """Scan all active markets for dual-side buy opportunities.
 
+    Uses Gamma API outcome_prices for price discovery (NOT orderbook asks,
+    which are $0.99 on thin fast markets). Places limit orders at Gamma price.
+
     Returns ranked list of opportunities sorted by priority (highest first).
     """
     now = datetime.now(timezone.utc)
@@ -1191,49 +1197,53 @@ def find_arbitrage_opportunities(markets, client, window_positions, momentum=Non
         if not clob_token_ids or len(clob_token_ids) < 2:
             continue
 
-        ob = get_orderbook_prices(client, clob_token_ids)
-        if not ob:
-            if verbose:
-                print(f"    skip {m.get('slug', '')}: could not fetch orderbook")
-            continue
-
         slug = m.get("slug", "")
         window_pos = window_positions.get(slug, {})
 
-        # Log orderbook state
-        yes_ask = ob.get("yes_best_ask")
-        no_ask = ob.get("no_best_ask")
+        # Use Gamma API outcome_prices (reflects actual market pricing)
+        # NOT orderbook asks (which sit at $0.99 on thin fast markets)
+        try:
+            prices = json.loads(m.get("outcome_prices", "[]"))
+            yes_price = float(prices[0]) if prices else None
+            no_price = float(prices[1]) if len(prices) > 1 else None
+        except (json.JSONDecodeError, IndexError, ValueError):
+            yes_price = None
+            no_price = None
+
+        if yes_price is None and no_price is None:
+            if verbose:
+                print(f"    skip {slug}: no outcome prices available")
+            continue
+
         if verbose:
-            yes_str = f"${yes_ask:.3f}" if yes_ask else "n/a"
-            no_str = f"${no_ask:.3f}" if no_ask else "n/a"
-            print(f"    {slug}: YES ask={yes_str} NO ask={no_str} ({remaining:.0f}s left)")
+            yes_str = f"${yes_price:.3f}" if yes_price else "n/a"
+            no_str = f"${no_price:.3f}" if no_price else "n/a"
+            print(f"    {slug}: YES={yes_str} NO={no_str} ({remaining:.0f}s left)")
 
         # Evaluate YES side
-        if yes_ask is not None:
-            can_buy, reason, priority = should_buy_side("yes", yes_ask, window_pos, momentum)
+        if yes_price is not None:
+            can_buy, reason, priority = should_buy_side("yes", yes_price, window_pos, momentum)
             if can_buy:
                 opportunities.append({
-                    "market": m, "side": "yes", "price": yes_ask,
-                    "available_size": ob.get("yes_ask_size", 0),
+                    "market": m, "side": "yes", "price": yes_price,
                     "priority": priority, "reason": reason,
-                    "window_pos": window_pos, "ob_data": ob,
+                    "window_pos": window_pos,
                     "remaining_seconds": remaining,
                 })
-            elif verbose and yes_ask <= ENTRY_THRESHOLD:
+            elif verbose and yes_price <= ENTRY_THRESHOLD:
                 print(f"      YES skip: {reason}")
 
         # Evaluate NO side
-        if no_ask is not None:
-            can_buy, reason, priority = should_buy_side("no", no_ask, window_pos, momentum)
+        if no_price is not None:
+            can_buy, reason, priority = should_buy_side("no", no_price, window_pos, momentum)
             if can_buy:
                 opportunities.append({
-                    "market": m, "side": "no", "price": no_ask,
-                    "available_size": ob.get("no_ask_size", 0),
+                    "market": m, "side": "no", "price": no_price,
                     "priority": priority, "reason": reason,
-                    "window_pos": window_pos, "ob_data": ob,
+                    "window_pos": window_pos,
                     "remaining_seconds": remaining,
                 })
-            elif verbose and no_ask <= ENTRY_THRESHOLD:
+            elif verbose and no_price <= ENTRY_THRESHOLD:
                 print(f"      NO skip: {reason}")
 
     opportunities.sort(key=lambda x: -x["priority"])
@@ -1393,6 +1403,145 @@ def execute_trade(clob_token_ids, side, amount, price):
         return {"error": str(e)}
 
 
+def place_limit_order(clob_token_ids, side, amount, price):
+    """Place a GTC limit buy order that rests on the book until filled.
+
+    Unlike execute_trade(), this does NOT cancel unfilled orders.
+    Returns order info for pending order tracking.
+    """
+    client = get_clob_client()
+    token_id = clob_token_ids[0] if side == "yes" else clob_token_ids[1]
+    size = math.floor((amount / price) * 100) / 100
+
+    if size < MIN_SHARES_PER_ORDER:
+        return {"error": f"Size {size} below minimum {MIN_SHARES_PER_ORDER} shares"}
+
+    try:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=round(price, 2),
+            size=round(size, 2),
+            side=BUY,
+        )
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+
+        if resp and resp.get("success"):
+            order_id = resp.get("orderID") or resp.get("orderId")
+
+            # Brief wait then check initial fill status
+            time.sleep(5)
+            try:
+                order_status = client.get_order(order_id)
+                status = order_status.get("status", "") if order_status else ""
+                size_matched = float(order_status.get("size_matched", 0) or 0) if order_status else 0
+
+                if status == "MATCHED":
+                    return {"success": True, "order_id": order_id,
+                            "shares_bought": size_matched or size, "status": "MATCHED"}
+                elif status == "LIVE":
+                    # Order is resting — return as pending
+                    return {"success": True, "order_id": order_id,
+                            "shares_bought": size_matched, "size_requested": size,
+                            "status": "LIVE", "pending": True}
+                else:
+                    return {"success": True, "order_id": order_id,
+                            "shares_bought": size, "status": status}
+            except Exception:
+                return {"success": True, "order_id": order_id,
+                        "shares_bought": 0, "size_requested": size,
+                        "status": "UNKNOWN", "pending": True}
+        else:
+            error_msg = resp.get("errorMsg", "Unknown CLOB error") if resp else "No response"
+            return {"error": error_msg}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_pending_orders(window_positions, verbose=True):
+    """Check status of pending limit orders from previous cycles.
+
+    Updates window positions with any new fills. Returns (filled, canceled) counts.
+    """
+    client = get_clob_client()
+    filled_count = 0
+    canceled_count = 0
+
+    for slug, wp in window_positions.items():
+        pending = wp.get("pending_orders", [])
+        if not pending:
+            continue
+
+        still_pending = []
+        for order in pending:
+            order_id = order.get("order_id")
+            if not order_id:
+                continue
+
+            try:
+                status_resp = client.get_order(order_id)
+                status = status_resp.get("status", "") if status_resp else ""
+                size_matched = float(status_resp.get("size_matched", 0) or 0) if status_resp else 0
+
+                if status == "MATCHED":
+                    side = order.get("side", "yes")
+                    price = order.get("price", 0)
+                    already_counted = order.get("matched_counted", 0)
+                    new_shares = (size_matched or order.get("size", 0)) - already_counted
+
+                    if new_shares > 0:
+                        cost = new_shares * price
+                        if side == "yes":
+                            old_total = wp["yes_shares"] * wp["yes_avg_price"]
+                            wp["yes_shares"] += new_shares
+                            wp["yes_avg_price"] = (old_total + cost) / wp["yes_shares"] if wp["yes_shares"] > 0 else price
+                            wp["yes_total_cost"] += cost
+                        else:
+                            old_total = wp["no_shares"] * wp["no_avg_price"]
+                            wp["no_shares"] += new_shares
+                            wp["no_avg_price"] = (old_total + cost) / wp["no_shares"] if wp["no_shares"] > 0 else price
+                            wp["no_total_cost"] += cost
+                        wp["trade_count"] += 1
+                        if verbose:
+                            print(f"    ✅ Filled: {new_shares:.1f} {side.upper()} @ ${price:.3f} ({slug})")
+                    filled_count += 1
+
+                elif status == "LIVE":
+                    already_counted = order.get("matched_counted", 0)
+                    new_matched = size_matched - already_counted
+                    if new_matched > 0:
+                        side = order.get("side", "yes")
+                        price = order.get("price", 0)
+                        cost = new_matched * price
+                        if side == "yes":
+                            old_total = wp["yes_shares"] * wp["yes_avg_price"]
+                            wp["yes_shares"] += new_matched
+                            wp["yes_avg_price"] = (old_total + cost) / wp["yes_shares"] if wp["yes_shares"] > 0 else price
+                            wp["yes_total_cost"] += cost
+                        else:
+                            old_total = wp["no_shares"] * wp["no_avg_price"]
+                            wp["no_shares"] += new_matched
+                            wp["no_avg_price"] = (old_total + cost) / wp["no_shares"] if wp["no_shares"] > 0 else price
+                            wp["no_total_cost"] += cost
+                        order["matched_counted"] = size_matched
+                        if verbose:
+                            print(f"    📊 Partial fill: +{new_matched:.1f} {order.get('side', '?').upper()} @ ${price:.3f}")
+                    still_pending.append(order)
+
+                else:
+                    # CANCELLED or other terminal status
+                    canceled_count += 1
+                    if verbose:
+                        print(f"    ⏹️  Order {order_id[:12]}... {status}")
+
+            except Exception:
+                still_pending.append(order)
+
+        wp["pending_orders"] = still_pending
+
+    return filled_count, canceled_count
+
+
 def calculate_position_size(max_size, smart_sizing=False):
     """Calculate position size, optionally based on portfolio."""
     if not smart_sizing:
@@ -1432,7 +1581,7 @@ def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False
     log(f"  Strategy:           ARBITRAGE (dual-side probability compression)")
     log(f"  Asset:              {ASSET}")
     log(f"  Windows:            {', '.join(WINDOWS)}")
-    log(f"  Entry threshold:    ${ENTRY_THRESHOLD:.2f} (buy when ask drops below)")
+    log(f"  Entry threshold:    ${ENTRY_THRESHOLD:.2f} (buy when Gamma price drops below)")
     log(f"  Max combined cost:  ${MAX_COMBINED_COST:.2f} (per matched YES+NO pair)")
     log(f"  Trade size:         ${ARB_TRADE_SIZE:.2f} per trade")
     log(f"  Max unhedged ratio: {MAX_UNHEDGED_RATIO:.0%}")
@@ -1486,14 +1635,25 @@ def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False
     # Load window positions state
     window_positions = load_window_positions(__file__)
 
+    # Check pending orders from previous cycles
+    pending_total = sum(len(wp.get("pending_orders", [])) for wp in window_positions.values())
+    if pending_total > 0:
+        log(f"\n📋 Checking {pending_total} pending order(s)...")
+        filled, canceled = check_pending_orders(window_positions, verbose=not quiet)
+        if filled > 0 or canceled > 0:
+            log(f"  Pending orders: {filled} filled, {canceled} canceled")
+            save_window_positions(__file__, window_positions)
+
     # Show current accumulated positions
     if window_positions:
         log(f"\n📦 Active window positions: {len(window_positions)}")
         for slug, wp in window_positions.items():
             metrics = calculate_combined_cost(wp)
+            pending_count = len(wp.get("pending_orders", []))
+            pending_str = f" pending={pending_count}" if pending_count > 0 else ""
             log(f"  {slug}: YES={wp['yes_shares']:.0f}@${wp['yes_avg_price']:.2f} "
                 f"NO={wp['no_shares']:.0f}@${wp['no_avg_price']:.2f} "
-                f"pairs={metrics['matched_pairs']:.0f} profit=${metrics['total_guaranteed_profit']:.2f}")
+                f"pairs={metrics['matched_pairs']:.0f} profit=${metrics['total_guaranteed_profit']:.2f}{pending_str}")
 
     # Step 1: Fetch momentum (optional tiebreaker)
     log(f"\n📈 Fetching {ASSET} momentum (tiebreaker only)...")
@@ -1515,8 +1675,8 @@ def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False
         save_window_positions(__file__, window_positions)
         return
 
-    # Step 3: Scan orderbooks for entry opportunities
-    log(f"\n🎯 Scanning orderbooks for arbitrage opportunities...")
+    # Step 3: Scan for entry opportunities using Gamma prices
+    log(f"\n🎯 Scanning Gamma prices for arbitrage opportunities...")
     opportunities = find_arbitrage_opportunities(
         markets, client, window_positions, momentum, verbose=not quiet
     )
@@ -1571,19 +1731,47 @@ def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False
         return
 
     if dry_run:
-        log(f"  [DRY RUN] Would buy {side.upper()} ${trade_amount:.2f} (~{desired_shares:.1f} shares)", force=True)
+        log(f"  [DRY RUN] Would place limit buy {side.upper()} ${trade_amount:.2f} (~{desired_shares:.1f} shares) @ ${price:.3f}", force=True)
         # Still track in window_positions for dry-run visibility
         update_window_position(window_positions, slug, side, desired_shares, price, m)
     else:
-        log(f"  Executing {side.upper()} trade for ${trade_amount:.2f}...", force=True)
-        result = execute_trade(clob_token_ids, side, trade_amount, price)
+        log(f"  Placing limit buy {side.upper()} ${trade_amount:.2f} @ ${price:.3f}...", force=True)
+        result = place_limit_order(clob_token_ids, side, trade_amount, price)
 
         if result and result.get("success"):
-            shares = result.get("shares_bought", 0)
-            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+            order_id = result.get("order_id", "")
+            shares_filled = result.get("shares_bought", 0)
+            order_status = result.get("status", "UNKNOWN")
 
-            # Update window position tracking
-            update_window_position(window_positions, slug, side, shares, price, m)
+            if order_status == "MATCHED":
+                # Fully filled immediately
+                log(f"  ✅ Filled: {shares_filled:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+                update_window_position(window_positions, slug, side, shares_filled, price, m)
+            elif result.get("pending"):
+                # Order resting on book — track as pending
+                # Ensure window position entry exists for pending tracking
+                if slug not in window_positions:
+                    update_window_position(window_positions, slug, side, 0, price, m)
+                if "pending_orders" not in window_positions[slug]:
+                    window_positions[slug]["pending_orders"] = []
+                window_positions[slug]["pending_orders"].append({
+                    "order_id": order_id,
+                    "side": side,
+                    "price": price,
+                    "size": result.get("size_requested", desired_shares),
+                    "matched_counted": shares_filled,
+                    "placed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                if shares_filled > 0:
+                    log(f"  📊 Partial fill: {shares_filled:.1f} shares, rest pending ({order_id[:12]}...)", force=True)
+                    update_window_position(window_positions, slug, side, shares_filled, price, m)
+                else:
+                    log(f"  📋 Order resting on book ({order_id[:12]}...) — will check next cycle", force=True)
+            else:
+                # Unknown status — assume filled
+                shares_filled = shares_filled or desired_shares
+                log(f"  ✅ Order accepted: {shares_filled:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+                update_window_position(window_positions, slug, side, shares_filled, price, m)
 
             # Update daily spend
             daily_spend["spent"] += trade_amount
@@ -1594,16 +1782,18 @@ def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False
             updated_metrics = calculate_combined_cost(window_positions[slug])
 
             # Slack notification with arb context
-            suffix = (f"• Arb: pairs={updated_metrics['matched_pairs']:.0f}, "
+            status_str = "FILLED" if order_status == "MATCHED" else "PENDING"
+            suffix = (f"• Status: {status_str}\n"
+                      f"• Arb: pairs={updated_metrics['matched_pairs']:.0f}, "
                       f"combined=${updated_metrics['combined_cost_per_pair']:.3f}, "
                       f"profit=${updated_metrics['total_guaranteed_profit']:.2f}")
-            notify_trade(side, shares, price, m["question"],
+            notify_trade(side, shares_filled or desired_shares, price, m["question"],
                          updated_metrics["total_guaranteed_profit"], suffix=suffix)
 
             # Trade journal
             if JOURNAL_AVAILABLE:
                 log_trade(
-                    trade_id=result.get("order_id", ""),
+                    trade_id=order_id,
                     source=TRADE_SOURCE,
                     thesis=f"ARB: {side.upper()} @ ${price:.3f}, combined=${updated_metrics['combined_cost_per_pair']:.3f}",
                     confidence=0.85,
@@ -1614,12 +1804,8 @@ def run_arbitrage_strategy(dry_run=True, positions_only=False, show_config=False
                 )
         else:
             error = result.get("error", "Unknown") if result else "No response"
-            is_no_liquidity = "liquidity" in error.lower() or "not filled" in error.lower()
-            if is_no_liquidity:
-                log(f"  ⏸️  No liquidity at ${price:.2f}", force=True)
-            else:
-                log(f"  ❌ Trade failed: {error}", force=True)
-                send_slack_notification(f"❌ *Arb Trade Failed*\n• Market: {m['question'][:40]}...\n• Error: {error}", "❌")
+            log(f"  ❌ Order failed: {error}", force=True)
+            send_slack_notification(f"❌ *Arb Order Failed*\n• Market: {m['question'][:40]}...\n• Error: {error}", "❌")
 
     # Save updated window positions
     save_window_positions(__file__, window_positions)
