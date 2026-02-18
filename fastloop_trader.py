@@ -496,6 +496,9 @@ def calculate_momentum_fair_value(momentum):
     Instead of flat 50¢, shift fair value based on how much BTC has moved.
     A clear directional move means the momentum side is worth more than 50¢.
     
+    Scaling: 1.5x multiplier so that a 0.1% BTC move → 15¢ fair value shift.
+    This reflects that even small BTC moves strongly predict the 5m/15m outcome.
+    
     Returns: (yes_fair, no_fair, momentum_strength)
     """
     if not momentum or momentum.get("direction") == "neutral":
@@ -504,10 +507,9 @@ def calculate_momentum_fair_value(momentum):
     momentum_pct = abs(momentum["momentum_pct"])
     direction = momentum["direction"]
     
-    # Scale fair value shift based on momentum magnitude
-    # 0.05% → small shift (52-53%), 0.2% → moderate (57-60%), 0.5%+ → strong (65%+)
-    # Capped at 25% shift from 50¢ to avoid extreme estimates
-    fair_value_shift = min(0.25, momentum_pct * 0.50)
+    # Aggressive scaling: small BTC moves have big predictive power for short windows
+    # 0.02% → 3¢ shift, 0.05% → 7.5¢, 0.1% → 15¢, 0.2% → 25¢ (cap)
+    fair_value_shift = min(0.25, momentum_pct * 1.50)
     
     if direction == "up":
         yes_fair = 0.50 + fair_value_shift
@@ -520,7 +522,8 @@ def calculate_momentum_fair_value(momentum):
 
 
 # Minimum CEX momentum to consider a trade (skip noise)
-MIN_MOMENTUM_PCT = 0.04
+# BTC typically moves 0.01-0.05% per 3 minutes; 0.04% was too high (bot was idle ~90%)
+MIN_MOMENTUM_PCT = 0.015
 
 
 def find_best_fast_market(markets, momentum=None, verbose=True):
@@ -581,47 +584,28 @@ def find_best_fast_market(markets, momentum=None, verbose=True):
         yes_edge = yes_fair - yes_price
         no_edge = no_fair - no_price
         
-        # Pick the side that momentum favors AND has positive edge
+        # ONLY buy the side momentum favors — never go counter-momentum
         if momentum_direction == "up":
-            # Momentum says UP → prefer YES
+            # Momentum says UP → only consider YES
             if yes_edge > 0 and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
                 best_side = "yes"
                 best_price = yes_price
                 best_edge = yes_edge
-            elif no_edge > 0 and no_price >= MIN_PRICE and no_price <= MAX_PRICE:
-                # NO still has edge somehow (unusual, maybe momentum just started)
-                best_side = "no"
-                best_price = no_price
-                best_edge = no_edge
             else:
                 stats["filtered_price_range"] += 1
                 continue
         elif momentum_direction == "down":
-            # Momentum says DOWN → prefer NO
+            # Momentum says DOWN → only consider NO
             if no_edge > 0 and no_price >= MIN_PRICE and no_price <= MAX_PRICE:
                 best_side = "no"
                 best_price = no_price
                 best_edge = no_edge
-            elif yes_edge > 0 and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
-                best_side = "yes"
-                best_price = yes_price
-                best_edge = yes_edge
             else:
                 stats["filtered_price_range"] += 1
                 continue
         else:
-            # No clear momentum → find best value side (old approach as fallback)
-            if yes_edge > no_edge and yes_edge > 0 and yes_price >= MIN_PRICE and yes_price <= MAX_PRICE:
-                best_side = "yes"
-                best_price = yes_price
-                best_edge = yes_edge
-            elif no_edge > 0 and no_price >= MIN_PRICE and no_price <= MAX_PRICE:
-                best_side = "no"
-                best_price = no_price
-                best_edge = no_edge
-            else:
-                stats["filtered_price_range"] += 1
-                continue
+            stats["filtered_no_momentum"] += 1
+            continue
         
         # Only consider if edge is above threshold
         if best_edge < MIN_VALUE_EDGE:
