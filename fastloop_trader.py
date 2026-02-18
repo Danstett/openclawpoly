@@ -255,6 +255,22 @@ def simmer_request(path, method="GET", data=None, api_key=None, timeout=15):
     return _api_request(f"{SIMMER_BASE}{path}", method=method, data=data, headers=headers, timeout=timeout)
 
 
+def ensure_simmer_limits(api_key):
+    """Ensure Simmer account has high trade limits (up to 1000/day)."""
+    result = simmer_request("/api/sdk/user/settings", method="PATCH", data={
+        "max_trades_per_day": 1000,
+        "max_position_usd": 1000.0,
+    }, api_key=api_key)
+    
+    if result and not result.get("error"):
+        print("  ✓ Simmer limits set: 1000 trades/day, $1000 max position")
+        return True
+    else:
+        error = result.get("error", "Unknown error") if result else "No response"
+        print(f"  ⚠️ Could not update Simmer limits: {error}")
+        return False
+
+
 # =============================================================================
 # Slack Notifications
 # =============================================================================
@@ -1288,6 +1304,11 @@ if __name__ == "__main__":
     
     if loop_mode:
         print(f"🔄 Running in loop mode (interval: {interval}s)")
+        
+        # Ensure Simmer account has max limits (1000 trades/day)
+        api_key = get_api_key()
+        ensure_simmer_limits(api_key)
+        
         print("=" * 50)
         run_count = 0
         while True:
