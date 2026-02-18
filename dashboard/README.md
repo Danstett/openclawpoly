@@ -4,10 +4,9 @@ Simple dashboard to monitor your Polymarket FastLoop trading bot.
 
 ## Features
 
-- Wallet balance display
 - Active positions with P&L
 - Recent trades history
-- Auto-refresh every 30 seconds
+- Auto-refresh every 60 seconds
 
 ## Deploy to Vercel
 
@@ -18,7 +17,7 @@ Simple dashboard to monitor your Polymarket FastLoop trading bot.
 3. Set the **Root Directory** to `dashboard`
 
 4. Add environment variable:
-   - `SIMMER_API_KEY` = your Simmer API key
+   - `POLYMARKET_WALLET_ADDRESS` = your Polygon wallet address
 
 5. Deploy!
 
@@ -28,8 +27,8 @@ Simple dashboard to monitor your Polymarket FastLoop trading bot.
 cd dashboard
 npm install
 
-# Create .env.local with your API key
-echo "SIMMER_API_KEY=your_key_here" > .env.local
+# Create .env.local with your wallet address
+echo "POLYMARKET_WALLET_ADDRESS=0xYourAddress" > .env.local
 
 npm run dev
 ```

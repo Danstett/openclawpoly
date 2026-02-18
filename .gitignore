@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+daily_spend.json
+notified_redeemable.json

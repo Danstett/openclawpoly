@@ -1,50 +1,41 @@
 import { NextResponse } from 'next/server'
 
-const SIMMER_BASE = process.env.SIMMER_API_BASE || 'https://api.simmer.markets'
+const DATA_API = 'https://data-api.polymarket.com'
 
 export async function GET() {
-  const apiKey = process.env.SIMMER_API_KEY
-  
-  if (!apiKey) {
-    return NextResponse.json({ error: 'SIMMER_API_KEY not configured' }, { status: 500 })
+  const walletAddress = process.env.POLYMARKET_WALLET_ADDRESS
+
+  if (!walletAddress) {
+    return NextResponse.json({ error: 'POLYMARKET_WALLET_ADDRESS not configured' }, { status: 500 })
   }
 
   try {
-    // Try multiple endpoints to get trade history
-    const endpoints = [
-      '/api/sdk/trades?limit=50',
-      '/api/sdk/history?limit=50',
-      '/api/sdk/orders?limit=50',
-    ]
+    const res = await fetch(
+      `${DATA_API}/activity?user=${walletAddress}&limit=50`,
+      { cache: 'no-store' }
+    )
 
-    let trades: any[] = []
-    let lastError = null
-
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(`${SIMMER_BASE}${endpoint}`, {
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'User-Agent': 'fastloop-dashboard/1.0',
-          },
-          cache: 'no-store',
-        })
-
-        if (res.ok) {
-          const data = await res.json()
-          // Extract trades from response
-          const tradesList = data.trades || data.orders || data.history || data.data || data
-          if (Array.isArray(tradesList) && tradesList.length > 0) {
-            trades = tradesList
-            break
-          }
-        }
-      } catch (e) {
-        lastError = e
-      }
+    if (!res.ok) {
+      return NextResponse.json({ trades: [], error: `Data API error: ${res.status}` }, { status: 200 })
     }
 
-    return NextResponse.json({ trades, error: trades.length === 0 ? lastError : null })
+    const rawActivity = await res.json()
+    const activityList = Array.isArray(rawActivity) ? rawActivity : []
+
+    // Normalize to match dashboard Trade interface
+    const trades = activityList.map((a: any) => ({
+      id: a.id || '',
+      market_question: a.title || '',
+      side: (a.outcome || '').toLowerCase(),
+      action: (a.type || 'TRADE').toLowerCase() === 'sell' ? 'sell' : 'buy',
+      shares: parseFloat(a.size || '0'),
+      cost: parseFloat(a.amount || a.cashAmount || '0'),
+      price_before: parseFloat(a.price || '0'),
+      created_at: a.timestamp || a.createdAt || '',
+      source: 'polymarket-clob',
+    }))
+
+    return NextResponse.json({ trades })
   } catch (error) {
     return NextResponse.json({ trades: [], error: String(error) }, { status: 200 })
   }
